@@ -12,6 +12,9 @@ export const defaultRuleSettings: RuleSettings = {
   lowCtrThreshold: 1,
   requiredAdsBeforeProductJudgment: 8,
   requiredAnglesBeforeProductJudgment: 4,
+  requiredFormatsBeforeProductJudgment: 2,
+  minimumAdImpressionsForCtrJudgment: 1000,
+  minimumAdClicksForFunnelJudgment: 20,
   productTestBudgetCap: 500,
   certifyProductMinPurchases: 10,
   certifyProductCpaMultiplier: 1,
@@ -40,6 +43,9 @@ export function normalizeRuleSettings(input: Partial<RuleSettings> | null | unde
   next.lowCtrThreshold = Math.max(0, next.lowCtrThreshold);
   next.requiredAdsBeforeProductJudgment = Math.max(1, next.requiredAdsBeforeProductJudgment);
   next.requiredAnglesBeforeProductJudgment = Math.max(1, next.requiredAnglesBeforeProductJudgment);
+  next.requiredFormatsBeforeProductJudgment = Math.max(1, next.requiredFormatsBeforeProductJudgment);
+  next.minimumAdImpressionsForCtrJudgment = Math.max(0, next.minimumAdImpressionsForCtrJudgment);
+  next.minimumAdClicksForFunnelJudgment = Math.max(0, next.minimumAdClicksForFunnelJudgment);
   next.productTestBudgetCap = Math.max(0, next.productTestBudgetCap);
   next.certifyProductMinPurchases = Math.max(0, next.certifyProductMinPurchases);
   next.certifyProductCpaMultiplier = Math.max(0, next.certifyProductCpaMultiplier);
@@ -52,4 +58,3 @@ export function normalizeRuleSettings(input: Partial<RuleSettings> | null | unde
   next.retargetingBudgetPercent = Math.max(0, next.retargetingBudgetPercent);
   return next;
 }
-

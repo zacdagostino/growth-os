@@ -37,6 +37,19 @@ export type ShopifyOrderSummary = {
   netSales: number;
 };
 
+export type ZendropOrderCost = {
+  id: string;
+  orderNumber: string;
+  orderDate?: string;
+  productName: string;
+  sku?: string;
+  quantity: number;
+  productCost: number;
+  shippingCost: number;
+  totalCost: number;
+  currency: CurrencyCode;
+};
+
 export type MetaCampaignImport = {
   campaignId: string;
   campaignName: string;
@@ -48,10 +61,30 @@ export type MetaCampaignImport = {
 };
 
 export type MetaAdImport = {
+  campaignId?: string;
   campaignName: string;
+  campaignObjective?: string;
+  objectiveLabel?: string;
+  adSetId?: string;
   adSetName: string;
+  optimizationGoal?: string;
   adName: string;
   metaAdId: string;
+  creativeImageUrl?: string;
+  creativeThumbnailUrl?: string;
+  creativeVideoUrl?: string;
+  creativeEmbedUrl?: string;
+  creativeType?: string;
+  firstActiveDate?: string;
+  lastActiveDate?: string;
+  activeDays?: number;
+  dailyActivity?: Array<{
+    date: string;
+    spend: number;
+    impressions: number;
+    clicks: number;
+    purchases: number;
+  }>;
   spend: number;
   impressions: number;
   clicks: number;
@@ -86,6 +119,78 @@ export type GrowthAdStatus =
   | "Killed"
   | "Recut Needed";
 
+export type AdLifecycleState =
+  | "Concept"
+  | "Draft"
+  | "Ready"
+  | "Live Testing"
+  | "Active Winner"
+  | "Paused"
+  | "Tested Winner"
+  | "Tested Loser"
+  | "Tested Mixed"
+  | "Insufficient Data"
+  | "Abandoned"
+  | "Invalid Test"
+  | "Fatigued"
+  | "Archived";
+
+export type AdTestOutcome = "Winner" | "Loser" | "Mixed" | "None";
+
+export type AdTestValidity = "Valid" | "Insufficient" | "Invalid" | "Needs Review";
+
+export type AdStopReason =
+  | "Hit Kill Threshold"
+  | "Hit Success Threshold"
+  | "Manually Stopped Too Early"
+  | "Budget Reallocated"
+  | "Tracking Problem"
+  | "Product Unavailable"
+  | "Creative Fatigue"
+  | "Campaign Restructure"
+  | "Policy Rejection"
+  | "Landing Page Issue"
+  | "Duplicate Creative"
+  | "Unknown";
+
+export type AdRecommendedAction =
+  | "Launch Test"
+  | "Keep Running"
+  | "Needs More Spend"
+  | "Kill"
+  | "Recut"
+  | "Fix Tracking"
+  | "Fix Landing Page"
+  | "Assign Product"
+  | "Add Angle"
+  | "Add Format"
+  | "Record Stop Reason"
+  | "Mark Duplicate"
+  | "Review Test Outcome"
+  | "Archive Duplicate"
+  | "Watch";
+
+export type AdAnnotation = {
+  metaAdId: string;
+  angle?: string;
+  hook?: string;
+  format?: string;
+  creativeFamilyId?: string;
+  launchedAt?: string;
+  stoppedAt?: string;
+  breakEvenCpaAtTest?: number;
+  trackingValid?: boolean;
+  landingPageValid?: boolean;
+  productAvailable?: boolean;
+  duplicateOfAdId?: string;
+  stopReason?: AdStopReason;
+  lifecycleState?: AdLifecycleState;
+  testOutcome?: AdTestOutcome;
+  testValidity?: AdTestValidity;
+  countsTowardProductTestOverride?: boolean;
+  notes?: string;
+};
+
 export type GrowthDecision =
   | "Scale"
   | "Keep Running"
@@ -103,12 +208,19 @@ export type Product = {
   name: string;
   shopifyProductId?: string;
   shopifyProductTitle?: string;
+  productImageUrl?: string;
   role: ProductRole;
   status: ProductStatus;
   dailyBudget: number;
   totalSpend: number;
   revenue: number;
   purchases: number;
+  zendropOrders: number;
+  zendropUnits: number;
+  zendropProductCost: number;
+  zendropShippingCost: number;
+  zendropLandedCost: number;
+  averageUnitLandedCost: number;
   breakEvenCpa: number;
   breakEvenCpaSource: "catalog" | "fallback";
   currentCpa: number;
@@ -123,8 +235,28 @@ export type GrowthAd = {
   metaAdId?: string;
   name: string;
   productId?: string;
+  campaignId?: string;
+  creativeImageUrl?: string;
+  creativeThumbnailUrl?: string;
+  creativeVideoUrl?: string;
+  creativeEmbedUrl?: string;
+  creativeType?: string;
   campaignName: string;
+  campaignObjective?: string;
+  objectiveLabel?: string;
+  adSetId?: string;
   adSetName: string;
+  optimizationGoal?: string;
+  firstActiveDate?: string;
+  lastActiveDate?: string;
+  activeDays?: number;
+  dailyActivity?: Array<{
+    date: string;
+    spend: number;
+    impressions: number;
+    clicks: number;
+    purchases: number;
+  }>;
   angle: string;
   hook: string;
   status: GrowthAdStatus;
@@ -138,6 +270,32 @@ export type GrowthAd = {
   roas: number;
   revenue: number;
   nextAction: string;
+};
+
+export type EvaluatedAdTest = GrowthAd & {
+  productName?: string;
+  productImageUrl?: string;
+  lifecycleState: AdLifecycleState;
+  testOutcome: AdTestOutcome;
+  testValidity: AdTestValidity;
+  stopReason?: AdStopReason;
+  countsTowardProductTest: boolean;
+  recommendedAction: AdRecommendedAction;
+  reason: string;
+  angle: string;
+  hook: string;
+  format: string;
+  creativeFamilyId?: string;
+  launchedAt?: string;
+  stoppedAt?: string;
+  breakEvenCpaAtTest?: number;
+  trackingValid: boolean;
+  landingPageValid: boolean;
+  duplicateOfAdId?: string;
+  notes?: string;
+  manualOverrides: string[];
+  isLaunched: boolean;
+  isStopped: boolean;
 };
 
 export type ProductAdMapping = {
@@ -165,6 +323,9 @@ export type RuleSettings = {
   lowCtrThreshold: number;
   requiredAdsBeforeProductJudgment: number;
   requiredAnglesBeforeProductJudgment: number;
+  requiredFormatsBeforeProductJudgment: number;
+  minimumAdImpressionsForCtrJudgment: number;
+  minimumAdClicksForFunnelJudgment: number;
   productTestBudgetCap: number;
   certifyProductMinPurchases: number;
   certifyProductCpaMultiplier: number;

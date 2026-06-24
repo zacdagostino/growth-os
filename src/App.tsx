@@ -7,10 +7,17 @@ import {
   SetStateAction,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type {
+  AdAnnotation,
+  AdLifecycleState,
+  AdStopReason,
+  AdTestOutcome,
+  AdTestValidity,
   CurrencyCode,
+  EvaluatedAdTest,
   GrowthAd,
   IntegrationConnection,
   MetaAdImport,
@@ -19,7 +26,17 @@ import type {
   Product,
   RuleSettings,
   ShopifyProductImport,
+  ZendropOrderCost,
 } from "./types";
+import {
+  AD_FORMAT_SUGGESTIONS,
+  buildStillNeeded,
+  evaluateAdTest,
+  getAngleCoverage,
+  getFormatCoverage,
+  getProductTestConclusion,
+  summarizeAdTesting,
+} from "./lib/ad-testing";
 import {
   applyProductMetrics,
   buildGrowthAds,
@@ -29,6 +46,7 @@ import {
   estimatedProfit,
   KNOWN_GROWTH_PRODUCTS,
   reconcileMappings,
+  slugify,
 } from "./lib/growth-data";
 import {
   buildWeeklyActionPlan,
@@ -62,6 +80,33 @@ const routes: Array<{ href: string; label: string; icon: NavIconName }> = [
 ];
 
 const settingsRoute = { href: "/settings", label: "Settings", icon: "settings" } as const;
+const AUTH_EMAIL_STORAGE_KEY = "growthos-auth-email";
+type AdEditorField =
+  | "productId"
+  | "angle"
+  | "hook"
+  | "format"
+  | "duplicateOfAdId"
+  | "trackingValid"
+  | "landingPageValid"
+  | "testOutcome"
+  | "testValidity"
+  | "stopReason";
+
+type AdIssueAction = {
+  detail: string;
+  field: AdEditorField;
+  label: string;
+};
+
+type AdCreativeState = {
+  embedUrl?: string;
+  imageUrl?: string;
+  name: string;
+  posterUrl?: string;
+  type?: string;
+  videoUrl?: string;
+};
 
 const initialConnections: IntegrationConnection[] = [
   {
@@ -100,6 +145,41 @@ const metaImportFields = [
   "conversion values",
 ];
 
+const adStopReasonOptions: Array<AdStopReason> = [
+  "Hit Kill Threshold",
+  "Hit Success Threshold",
+  "Manually Stopped Too Early",
+  "Budget Reallocated",
+  "Tracking Problem",
+  "Product Unavailable",
+  "Creative Fatigue",
+  "Campaign Restructure",
+  "Policy Rejection",
+  "Landing Page Issue",
+  "Duplicate Creative",
+  "Unknown",
+];
+
+const adLifecycleOptions: Array<AdLifecycleState> = [
+  "Concept",
+  "Draft",
+  "Ready",
+  "Live Testing",
+  "Active Winner",
+  "Paused",
+  "Tested Winner",
+  "Tested Loser",
+  "Tested Mixed",
+  "Insufficient Data",
+  "Abandoned",
+  "Invalid Test",
+  "Fatigued",
+  "Archived",
+];
+
+const adTestOutcomeOptions: Array<AdTestOutcome> = ["None", "Winner", "Loser", "Mixed"];
+const adTestValidityOptions: Array<AdTestValidity> = ["Valid", "Insufficient", "Invalid", "Needs Review"];
+
 const shopifyScopeOptions = [
   { value: "read_products", label: "Products" },
   { value: "read_orders", label: "Orders" },
@@ -137,6 +217,31 @@ function writeCachedJson(key: string, value: unknown) {
   } catch {
     // Ignore storage failures; live fetch still works.
   }
+}
+
+function getStoredAuthEmail() {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(AUTH_EMAIL_STORAGE_KEY) || "";
+}
+
+async function apiFetch(
+  input: string,
+  init: RequestInit = {},
+  profileEmail = getStoredAuthEmail(),
+) {
+  const headers = new Headers(init.headers || {});
+  if (profileEmail) headers.set("X-GrowthOS-Profile", profileEmail);
+  return fetch(input, {
+    ...init,
+    headers,
+  });
+}
+
+function buildProfileInstallPath(pathname: string) {
+  const email = getStoredAuthEmail();
+  if (!email) return pathname;
+  const separator = pathname.includes("?") ? "&" : "?";
+  return `${pathname}${separator}profileEmail=${encodeURIComponent(email)}`;
 }
 
 function loadRuleSettingsFromStorage() {
@@ -282,6 +387,134 @@ function formatRangeLabel(range: UniversalDateRange) {
   return `${formatter.format(start)} - ${formatter.format(end)}`;
 }
 
+function formatShortDate(value?: string) {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return "Not recorded";
+  const date = new Date(`${value}T00:00:00`);
+  return new Intl.DateTimeFormat("en-AU", {
+    month: "short",
+    day: "numeric",
+  }).format(date);
+}
+
+function formatActiveRange(startDate?: string, endDate?: string) {
+  if (!startDate && !endDate) return "No delivery";
+  if (startDate && endDate && startDate === endDate) return formatShortDate(startDate);
+  if (startDate && endDate) return `${formatShortDate(startDate)} - ${formatShortDate(endDate)}`;
+  return formatShortDate(startDate || endDate);
+}
+
+function parseCsvRows(input: string) {
+  const rows: string[][] = [];
+  let current = "";
+  let row: string[] = [];
+  let inQuotes = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    const next = input[index + 1];
+
+    if (char === "\"") {
+      if (inQuotes && next === "\"") {
+        current += "\"";
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      row.push(current.trim());
+      current = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && next === "\n") index += 1;
+      row.push(current.trim());
+      if (row.some((cell) => cell.length > 0)) rows.push(row);
+      row = [];
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  row.push(current.trim());
+  if (row.some((cell) => cell.length > 0)) rows.push(row);
+  return rows;
+}
+
+function normalizeHeader(value: string) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
+}
+
+function parseMoneyLike(value: string) {
+  const numeric = Number(String(value || "").replace(/[^0-9.-]+/g, ""));
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function parseZendropCsv(input: string): { orders: ZendropOrderCost[]; summary: ZendropImportSummary } {
+  const rows = parseCsvRows(input);
+  if (rows.length < 2) return { orders: [], summary: { currency: "USD", importedRows: 0, matchedRows: 0 } };
+  const headers = rows[0].map(normalizeHeader);
+  const dataRows = rows.slice(1);
+  const getValue = (cells: string[], names: string[]) => {
+    for (const name of names) {
+      const index = headers.indexOf(name);
+      if (index >= 0) return cells[index] || "";
+    }
+    return "";
+  };
+
+  const currency = headers.includes("currency") ? "AUD" : "USD";
+  const orders = dataRows
+    .map((cells, index) => {
+      const orderNumber = getValue(cells, ["order_number", "order_id", "zendrop_order_id", "order"]);
+      const productName = getValue(cells, ["product_name", "item_name", "product", "name"]);
+      if (!orderNumber || !productName) return null;
+      const quantity = Math.max(1, Number(getValue(cells, ["quantity", "qty"])) || 1);
+      const productCost = parseMoneyLike(getValue(cells, ["product_cost", "cost", "item_cost", "product_price"]));
+      const shippingCost = parseMoneyLike(getValue(cells, ["shipping_cost", "shipping", "shipping_price"]));
+      const totalCost = parseMoneyLike(getValue(cells, ["total_cost", "landed_cost", "order_cost"])) || productCost + shippingCost;
+      return {
+        id: `zendrop-${orderNumber}-${index}`,
+        orderNumber,
+        orderDate: getValue(cells, ["order_date", "created_at", "date"]) || undefined,
+        productName,
+        sku: getValue(cells, ["sku", "variant_sku"]) || undefined,
+        quantity,
+        productCost,
+        shippingCost,
+        totalCost,
+        currency,
+      } satisfies ZendropOrderCost;
+    })
+    .filter(Boolean) as ZendropOrderCost[];
+
+  return {
+    orders,
+    summary: {
+      currency,
+      importedRows: orders.length,
+      matchedRows: orders.filter((row) => row.productName.trim()).length,
+    },
+  };
+}
+
+function listDateRange(startDate: string, endDate: string) {
+  if (!startDate || !endDate || startDate > endDate) return [];
+  const dates: string[] = [];
+  const cursor = new Date(`${startDate}T00:00:00`);
+  const end = new Date(`${endDate}T00:00:00`);
+  while (cursor <= end) {
+    dates.push(localDateString(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return dates;
+}
+
 function formatStatus(status: IntegrationConnection["status"]) {
   if (status === "connected") return "Connected";
   if (status === "error") return "Error";
@@ -384,6 +617,25 @@ type ShopifyBranding = {
 type UiSettings = {
   appColor: string;
   logoUrl: string;
+};
+
+type ZendropAppSettings = {
+  configured: boolean;
+  accessToken: string;
+  accessTokenMasked: string;
+  scopes: string;
+  endpoint: string;
+  status: "not_connected" | "configured" | "connected";
+  storeId: string;
+  storeName: string;
+  storeUrl: string;
+  lastSyncAt: string;
+};
+
+type ZendropImportSummary = {
+  currency: CurrencyCode;
+  importedRows: number;
+  matchedRows: number;
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -558,12 +810,486 @@ function brandingStyle(primaryColor: string): CSSProperties {
   } as CSSProperties;
 }
 
+function LoginPage({
+  email,
+  notice,
+  onEmailChange,
+  onSubmit,
+}: {
+  email: string;
+  notice: string;
+  onEmailChange: (value: string) => void;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return (
+    <div className="auth-shell">
+      <section className="auth-card">
+        <span className="brand-mark auth-brand-mark">G</span>
+        <div className="auth-copy">
+          <p className="eyebrow">Login</p>
+          <h1>Open your GrowthOS workspace</h1>
+          <p>
+            Sign in with your email to load saved Shopify keys, Meta setup, mappings,
+            currency preferences, branding, and reporting range.
+          </p>
+        </div>
+        <form className="auth-form" onSubmit={onSubmit}>
+          <label htmlFor="login-email">Email</label>
+          <input
+            id="login-email"
+            type="email"
+            autoComplete="email"
+            value={email}
+            onChange={(event) => onEmailChange(event.target.value)}
+            placeholder="hello@insidecats.com"
+          />
+          <button className="btn btn-primary" type="submit">
+            Continue
+          </button>
+        </form>
+        {notice ? <p className="notice">{notice}</p> : null}
+      </section>
+    </div>
+  );
+}
+
+function ProductVisual({
+  name,
+  imageUrl,
+  size = "md",
+}: {
+  name: string;
+  imageUrl?: string;
+  size?: "sm" | "md" | "lg";
+}) {
+  return imageUrl ? (
+    <img
+      className={`product-thumb product-thumb-${size}`}
+      src={imageUrl}
+      alt={name}
+      loading="lazy"
+    />
+  ) : (
+    <div className={`product-thumb product-thumb-${size} product-thumb-fallback`} aria-hidden="true">
+      {name.slice(0, 1).toUpperCase()}
+    </div>
+  );
+}
+
+function AdCreativeVisual({
+  name,
+  imageUrl,
+  videoUrl,
+  posterUrl,
+  type,
+  size = "md",
+  onOpen,
+}: {
+  name: string;
+  imageUrl?: string;
+  videoUrl?: string;
+  posterUrl?: string;
+  type?: string;
+  size?: "sm" | "md";
+  onOpen?: () => void;
+}) {
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [hasError, setHasError] = useState(false);
+  const previewUrl = posterUrl || imageUrl;
+  const isVideo = Boolean(videoUrl);
+
+  const frame = previewUrl && !hasError ? (
+    <>
+      <img
+        className={`ad-creative-thumb ad-creative-thumb-${size}`}
+        src={previewUrl}
+        alt={`${name} creative`}
+        loading="lazy"
+        decoding="async"
+        onLoad={() => setIsLoaded(true)}
+        onError={() => {
+          setHasError(true);
+          setIsLoaded(true);
+        }}
+      />
+      {!isLoaded ? <span className="ad-creative-loading">Loading preview...</span> : null}
+      {isVideo ? <span className="ad-creative-play-badge">Play video</span> : null}
+    </>
+  ) : (
+    <div className={`ad-creative-thumb ad-creative-thumb-${size} ad-creative-thumb-fallback`} aria-hidden="true">
+      <span>{isVideo ? "Video" : type || "Creative"}</span>
+    </div>
+  );
+
+  return onOpen ? (
+    <button className={`ad-creative-frame ad-creative-frame-${size}`} type="button" onClick={onOpen}>
+      {frame}
+    </button>
+  ) : (
+    <div className={`ad-creative-frame ad-creative-frame-${size}`}>
+      {frame}
+    </div>
+  );
+}
+
+function AdCreativeLightbox({
+  creative,
+  onClose,
+}: {
+  creative: AdCreativeState;
+  onClose: () => void;
+}) {
+  const [isVideoLoading, setIsVideoLoading] = useState(Boolean(creative.videoUrl));
+  const [videoFailed, setVideoFailed] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
+
+  const posterUrl = creative.posterUrl || creative.imageUrl;
+
+  return (
+    <div className="creative-lightbox-backdrop" role="dialog" aria-modal="true" aria-label={`${creative.name} creative preview`}>
+      <div className="creative-lightbox">
+        <div className="creative-lightbox-header">
+          <div>
+            <strong>{creative.name}</strong>
+            <span>
+              {creative.videoUrl && !videoFailed
+                ? "Loading video player..."
+                : creative.type || "Creative preview"}
+            </span>
+          </div>
+          <button className="btn btn-secondary btn-icon" type="button" onClick={onClose} aria-label="Close creative player">
+            ×
+          </button>
+        </div>
+        <div className="creative-lightbox-body">
+          <div className="creative-lightbox-media">
+            {creative.videoUrl && !videoFailed ? (
+              <>
+                <video
+                  className="creative-lightbox-video"
+                  controls
+                  autoPlay
+                  playsInline
+                  preload="metadata"
+                  poster={posterUrl}
+                  onLoadedMetadata={() => setIsVideoLoading(false)}
+                  onCanPlay={() => setIsVideoLoading(false)}
+                  onWaiting={() => setIsVideoLoading(true)}
+                  onPlaying={() => setIsVideoLoading(false)}
+                  onError={() => {
+                    setVideoFailed(true);
+                    setIsVideoLoading(false);
+                  }}
+                >
+                  <source src={creative.videoUrl} />
+                </video>
+                {isVideoLoading ? <div className="creative-lightbox-loading">Loading video...</div> : null}
+              </>
+            ) : creative.embedUrl ? (
+              <>
+                <iframe
+                  className="creative-lightbox-embed"
+                  src={creative.embedUrl}
+                  allow="autoplay; clipboard-write; encrypted-media; picture-in-picture; web-share"
+                  allowFullScreen
+                  loading="eager"
+                  onLoad={() => setIsVideoLoading(false)}
+                  title={`${creative.name} embedded creative`}
+                />
+                {isVideoLoading ? <div className="creative-lightbox-loading">Loading video...</div> : null}
+              </>
+            ) : posterUrl ? (
+              <img className="creative-lightbox-image" src={posterUrl} alt={`${creative.name} creative`} loading="eager" decoding="async" />
+            ) : (
+              <div className="creative-lightbox-empty">Preview unavailable</div>
+            )}
+          </div>
+          <p className="muted">
+            {creative.videoUrl && !videoFailed
+              ? "Use the built-in controls to play, pause, scrub the timeline, or go fullscreen."
+              : creative.embedUrl
+                ? "Embedded player loaded from the creative permalink because Meta did not expose a direct MP4 source for this ad."
+              : "Meta did not return a playable video source for this ad, so the poster image is shown instead."}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdTimelineChart({
+  ad,
+  dateRange,
+  displayCurrency,
+  usdToAudRate,
+}: {
+  ad: GrowthAd;
+  dateRange: UniversalDateRange;
+  displayCurrency: ShopifyDisplayCurrency;
+  usdToAudRate: number;
+}) {
+  const [mode, setMode] = useState<"spend" | "cpa">("spend");
+  const [zoom, setZoom] = useState<"7d" | "14d" | "30d" | "all">("all");
+  const [hoveredDate, setHoveredDate] = useState<string | null>(null);
+
+  const allPoints = useMemo(() => {
+    const activityByDate = new Map(
+      (ad.dailyActivity || []).map((point) => [point.date, point]),
+    );
+    const startDate =
+      dateRange.preset === "all"
+        ? ad.firstActiveDate || ad.lastActiveDate || ""
+        : dateRange.startDate;
+    const endDate =
+      dateRange.preset === "all"
+        ? ad.lastActiveDate || ad.firstActiveDate || ""
+        : dateRange.endDate;
+    return listDateRange(startDate, endDate).map((date) => {
+      const point = activityByDate.get(date);
+      return {
+        date,
+        spend: point?.spend || 0,
+        impressions: point?.impressions || 0,
+        clicks: point?.clicks || 0,
+        purchases: point?.purchases || 0,
+        cpa: point && point.purchases > 0 ? point.spend / point.purchases : 0,
+        active: Boolean(point && (point.spend > 0 || point.impressions > 0 || point.clicks > 0)),
+      };
+    });
+  }, [ad.dailyActivity, ad.firstActiveDate, ad.lastActiveDate, dateRange.endDate, dateRange.preset, dateRange.startDate]);
+
+  const points = useMemo(() => {
+    if (zoom === "all" || allPoints.length <= Number.parseInt(zoom, 10)) return allPoints;
+    return allPoints.slice(-Number.parseInt(zoom, 10));
+  }, [allPoints, zoom]);
+
+  useEffect(() => {
+    setHoveredDate(null);
+  }, [zoom, ad.id, dateRange.endDate, dateRange.startDate, dateRange.preset]);
+
+  const chart = useMemo(() => {
+    if (!points.length) return null;
+    const width = 1000;
+    const height = 146;
+    const padX = 44;
+    const padTop = 24;
+    const padBottom = 30;
+    const plotHeight = height - padTop - padBottom;
+    const innerWidth = width - padX * 2;
+    const step = innerWidth / Math.max(points.length, 1);
+    const metricValues = points.map((point) => (mode === "spend" ? point.spend : point.cpa));
+    const maxMetric = Math.max(...metricValues, 0);
+    const midMetric = maxMetric / 2;
+    const starts: number[] = [];
+    const pauses: number[] = [];
+
+    points.forEach((point, index) => {
+      const previous = index > 0 ? points[index - 1] : null;
+      if (point.active && !previous?.active) starts.push(index);
+      if (!point.active && previous?.active) pauses.push(index);
+    });
+
+    const bars = points.map((point, index) => {
+      const barWidth = Math.max(step - 1.5, 1.5);
+      const x = padX + index * step + Math.max((step - barWidth) / 2, 0);
+      const value = mode === "spend" ? point.spend : point.cpa;
+      const barHeight = maxMetric > 0 ? Math.max((value / maxMetric) * plotHeight, value > 0 ? 2 : 0) : 0;
+      const y = height - padBottom - barHeight;
+      const stateY = 6;
+      return {
+        value,
+        x,
+        y,
+        barWidth,
+        barHeight,
+        stateY,
+        point,
+      };
+    });
+
+    const tickIndexes = [...new Set([
+      0,
+      Math.max(Math.floor((points.length - 1) / 2), 0),
+      Math.max(points.length - 1, 0),
+    ])];
+
+    return {
+      bars,
+      height,
+      maxMetric,
+      midMetric,
+      pauses: pauses.length,
+      starts: starts.length,
+      tickIndexes,
+      width,
+    };
+  }, [mode, points]);
+
+  if (!chart || !points.length) return null;
+
+  const hoveredPoint = hoveredDate
+    ? points.find((point) => point.date === hoveredDate) || null
+    : null;
+
+  return (
+    <div className="ad-timeline-card">
+      <div className="ad-timeline-header">
+        <div>
+          <strong>Delivery timeline</strong>
+          <span>
+            {chart.starts} start{chart.starts === 1 ? "" : "s"} • {chart.pauses} pause{chart.pauses === 1 ? "" : "s"} • {points.length} day view
+          </span>
+        </div>
+        <div className="ad-timeline-controls">
+          <label className="ad-timeline-mode-select">
+            <span>Mode</span>
+            <select
+              value={mode}
+              onChange={(event) => setMode(event.target.value as "spend" | "cpa")}
+            >
+              <option value="spend">Spend timeline</option>
+              <option value="cpa">CPA over time</option>
+            </select>
+          </label>
+          <div className="ad-timeline-zoom">
+            {[
+              ["7d", "7D"],
+              ["14d", "14D"],
+              ["30d", "30D"],
+              ["all", "All"],
+            ]
+              .filter(([value]) => value === "all" || allPoints.length > Number.parseInt(value, 10))
+              .map(([value, label]) => (
+                <button
+                  key={value}
+                  className={`scope-chip ${zoom === value ? "scope-chip-selected" : ""}`}
+                  type="button"
+                  onClick={() => setZoom(value as "7d" | "14d" | "30d" | "all")}
+                >
+                  {label}
+                </button>
+              ))}
+          </div>
+          <span className="ad-timeline-max">
+            Peak day {chart.maxMetric > 0
+              ? mode === "spend"
+                ? formatDisplayMoney(chart.maxMetric, OPERATING_CURRENCY, displayCurrency, usdToAudRate)
+                : formatDisplayMoney(chart.maxMetric, OPERATING_CURRENCY, displayCurrency, usdToAudRate)
+              : mode === "spend"
+                ? "A$0"
+                : "No purchases"}
+          </span>
+        </div>
+      </div>
+      <div className="ad-timeline-tooltip-shell" aria-live="polite">
+        {hoveredPoint ? (
+          <div className="ad-timeline-tooltip">
+            <strong>{formatShortDate(hoveredPoint.date)}</strong>
+            <span>
+              {mode === "spend"
+                ? `${formatDisplayMoney(hoveredPoint.spend, OPERATING_CURRENCY, displayCurrency, usdToAudRate)} spend`
+                : hoveredPoint.purchases > 0
+                  ? `${formatDisplayMoney(hoveredPoint.cpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate)} CPA`
+                  : "No purchases"}
+            </span>
+            <span>{hoveredPoint.active ? "Active" : "Paused"} • {hoveredPoint.impressions.toLocaleString()} impressions • {hoveredPoint.clicks.toLocaleString()} clicks • {hoveredPoint.purchases} purchases</span>
+          </div>
+        ) : (
+          <div className="ad-timeline-tooltip ad-timeline-tooltip-placeholder" aria-hidden="true">
+            <strong>Hover a bar</strong>
+            <span>See the exact daily value, delivery state, impressions, clicks, and purchases.</span>
+          </div>
+        )}
+      </div>
+      <svg className="ad-timeline-chart" viewBox={`0 0 ${chart.width} ${chart.height}`} preserveAspectRatio="none" role="img" aria-label={`Delivery timeline for ${ad.name}`}>
+        {[chart.maxMetric, chart.midMetric, 0].map((value, index) => {
+          const y = 24 + ((chart.height - 24 - 30) * index) / 2;
+          return (
+            <g key={`${value}-${index}`}>
+              <line x1="44" x2={chart.width - 44} y1={y} y2={y} className="ad-timeline-grid" />
+              <text x="6" y={y + 4} className="ad-timeline-label">
+                {mode === "spend"
+                  ? formatDisplayMoney(value, OPERATING_CURRENCY, displayCurrency, usdToAudRate)
+                  : value > 0
+                    ? formatDisplayMoney(value, OPERATING_CURRENCY, displayCurrency, usdToAudRate)
+                    : "A$0"}
+              </text>
+            </g>
+          );
+        })}
+        <line x1="44" x2={chart.width - 44} y1={chart.height - 30} y2={chart.height - 30} className="ad-timeline-axis" />
+        {chart.bars.map(({ x, y, barWidth, barHeight, stateY, point }, index) => (
+          <g
+            key={`${point.date}-${index}`}
+            onMouseEnter={() => setHoveredDate(point.date)}
+            onMouseLeave={() => setHoveredDate((current) => (current === point.date ? null : current))}
+          >
+            <rect
+              className={point.active ? "ad-timeline-state-active" : "ad-timeline-state-paused"}
+              x={x}
+              y={stateY}
+              width={barWidth}
+              height="8"
+              rx="3"
+            />
+            {barHeight > 0 ? (
+              <rect
+                className={hoveredDate === point.date ? "ad-timeline-bar ad-timeline-bar-hovered" : "ad-timeline-bar"}
+                x={x}
+                y={y}
+                width={barWidth}
+                height={barHeight}
+                rx="3"
+              />
+            ) : null}
+          </g>
+        ))}
+        {chart.tickIndexes.map((index) => {
+          const point = points[index];
+          if (!point) return null;
+          const x = 44 + index * ((chart.width - 88) / Math.max(points.length, 1));
+          return (
+            <text key={`${point.date}-tick`} x={x} y={chart.height - 8} className="ad-timeline-label ad-timeline-date-label" textAnchor={index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"}>
+              {formatShortDate(point.date)}
+            </text>
+          );
+        })}
+      </svg>
+      <div className="ad-timeline-footer">
+        <span>{formatActiveRange(points[0]?.date, points[points.length - 1]?.date)}</span>
+        <span>{mode === "spend" ? "Y axis = spend per day." : "Y axis = daily CPA when purchases occurred."} X axis = date. Hover any bar for exact values.</span>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [path, setPath] = useState(window.location.pathname);
+  const [currentUserEmail, setCurrentUserEmail] = useState(() => getStoredAuthEmail());
+  const [loginEmail, setLoginEmail] = useState(() => getStoredAuthEmail() || "hello@insidecats.com");
+  const [authNotice, setAuthNotice] = useState("");
+  const [profileStateReady, setProfileStateReady] = useState(false);
   const [connections, setConnections] =
     useState<IntegrationConnection[]>(initialConnections);
   const [mappings, setMappings] =
     useState<ProductAdMapping[]>(loadMappingsFromStorage);
+  const [adAnnotations, setAdAnnotations] =
+    useState<Record<string, AdAnnotation>>({});
+  const [zendropOrderCosts, setZendropOrderCosts] = useState<ZendropOrderCost[]>([]);
   const [ruleSettings, setRuleSettings] = useState<RuleSettings>(loadRuleSettingsFromStorage);
   const [growthShopifyProducts, setGrowthShopifyProducts] =
     useState<ShopifyProductImport[]>([]);
@@ -572,6 +1298,7 @@ export default function App() {
     const saved = Number(window.localStorage.getItem("growthos-daily-ad-budget"));
     return Number.isFinite(saved) && saved >= 0 ? saved : 100;
   });
+  const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false);
   const [isNavOpen, setIsNavOpen] = useState(false);
   const [shopifyNotice, setShopifyNotice] = useState("");
   const [backendOffline, setBackendOffline] = useState(false);
@@ -579,6 +1306,8 @@ export default function App() {
     useState<ShopifyAppSettings | null>(null);
   const [metaAppSettings, setMetaAppSettings] =
     useState<MetaAppSettings | null>(null);
+  const [zendropAppSettings, setZendropAppSettings] =
+    useState<ZendropAppSettings | null>(null);
   const [shopifyBranding, setShopifyBranding] = useState<ShopifyBranding | null>(null);
   const [uiSettings, setUiSettings] = useState<UiSettings>({ appColor: "", logoUrl: "" });
   const [shopifyDisplayCurrency, setShopifyDisplayCurrency] =
@@ -604,9 +1333,11 @@ export default function App() {
   });
 
   function navigate(href: string) {
-    window.history.pushState(null, "", href);
-    setPath(href);
+    const nextUrl = new URL(href, window.location.origin);
+    window.history.pushState(null, "", nextUrl.toString());
+    setPath(nextUrl.pathname);
     setIsNavOpen(false);
+    setIsAccountMenuOpen(false);
   }
 
   function isRouteActive(href: string) {
@@ -627,9 +1358,111 @@ export default function App() {
     );
   }
 
+  function buildProfileStatePayload() {
+    return {
+      mappings,
+      adAnnotations,
+      zendropOrderCosts,
+      ruleSettings,
+      dailyAdBudget,
+      displayCurrency: shopifyDisplayCurrency,
+      usdToAudRate,
+      usdToAudRateUpdatedAt,
+      usdToAudRateSource,
+      dateRange,
+    };
+  }
+
+  async function loadProfileState(profileEmail = currentUserEmail) {
+    const response = await apiFetch("/api/profile/state", { cache: "no-store" }, profileEmail);
+    if (!response.ok) throw new Error("Could not load saved profile state.");
+    const data = (await response.json()) as {
+      mappings?: ProductAdMapping[];
+      adAnnotations?: Record<string, AdAnnotation>;
+      zendropOrderCosts?: ZendropOrderCost[];
+      ruleSettings?: Partial<RuleSettings> | null;
+      dailyAdBudget?: number;
+      displayCurrency?: CurrencyCode;
+      usdToAudRate?: number;
+      usdToAudRateUpdatedAt?: string;
+      usdToAudRateSource?: string;
+      dateRange?: Partial<UniversalDateRange>;
+    };
+
+    setMappings(Array.isArray(data.mappings) ? data.mappings : []);
+    setAdAnnotations(data.adAnnotations && typeof data.adAnnotations === "object" ? data.adAnnotations : {});
+    setZendropOrderCosts(Array.isArray(data.zendropOrderCosts) ? data.zendropOrderCosts : []);
+    setRuleSettings(normalizeRuleSettings(data.ruleSettings || defaultRuleSettings));
+    setDailyAdBudget(Math.max(0, Number(data.dailyAdBudget) || 0));
+    setShopifyDisplayCurrency(data.displayCurrency === "AUD" ? "AUD" : "USD");
+    setUsdToAudRate(Number.isFinite(Number(data.usdToAudRate)) && Number(data.usdToAudRate) > 0 ? Number(data.usdToAudRate) : 1.55);
+    setUsdToAudRateUpdatedAt(String(data.usdToAudRateUpdatedAt || ""));
+    setUsdToAudRateSource(String(data.usdToAudRateSource || "cached"));
+    setDateRange(normalizeDateRange(data.dateRange));
+  }
+
+  async function syncProfileState(profileEmail = currentUserEmail, payload = buildProfileStatePayload()) {
+    await apiFetch(
+      "/api/profile/state",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+      profileEmail,
+    );
+  }
+
+  async function loginWithEmail(event: FormEvent) {
+    event.preventDefault();
+    const normalizedEmail = loginEmail.trim().toLowerCase();
+    if (!normalizedEmail) {
+      setAuthNotice("Enter an email address.");
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: normalizedEmail }),
+      });
+      const data = (await response.json()) as { error?: string; email?: string; needsClientMigration?: boolean };
+      if (!response.ok || !data.email) {
+        setAuthNotice(data.error || "Could not log in.");
+        return;
+      }
+
+      window.localStorage.setItem(AUTH_EMAIL_STORAGE_KEY, data.email);
+      setCurrentUserEmail(data.email);
+      setProfileStateReady(false);
+      if (data.needsClientMigration) {
+        await syncProfileState(data.email, buildProfileStatePayload());
+      }
+      await loadProfileState(data.email);
+      setProfileStateReady(true);
+      setAuthNotice("");
+    } catch {
+      setAuthNotice("Could not log in.");
+    }
+  }
+
+  function logout() {
+    window.localStorage.removeItem(AUTH_EMAIL_STORAGE_KEY);
+    setCurrentUserEmail("");
+    setProfileStateReady(false);
+    setAuthNotice("");
+    setIsAccountMenuOpen(false);
+  }
+
+  function switchAccount() {
+    setLoginEmail("");
+    logout();
+  }
+
   async function refreshUsdToAudRate() {
     try {
-      const response = await fetch("/api/market/fx/usd-aud", { cache: "no-store" });
+      const response = await apiFetch("/api/market/fx/usd-aud", { cache: "no-store" });
       if (!response.ok) throw new Error("Could not load current USD/AUD rate.");
       const data = (await response.json()) as {
         rate?: number;
@@ -658,6 +1491,7 @@ export default function App() {
   )!;
 
   useEffect(() => {
+    if (!currentUserEmail) return;
     const params = new URLSearchParams(window.location.search);
     const shop = params.get("shop") || "";
     const status = params.get("shopify");
@@ -669,7 +1503,7 @@ export default function App() {
     async function loadShopifyConnection() {
       try {
         const query = shop ? `?shop=${encodeURIComponent(shop)}` : "";
-        const response = await fetch(`/api/integrations/shopify/status${query}`);
+        const response = await apiFetch(`/api/integrations/shopify/status${query}`);
         setBackendOffline(false);
         if (!response.ok) return null;
         const data = (await response.json()) as {
@@ -704,7 +1538,7 @@ export default function App() {
 
     async function loadShopifyAppSettings() {
       try {
-        const response = await fetch("/api/settings/shopify-app");
+        const response = await apiFetch("/api/settings/shopify-app");
         setBackendOffline(false);
         if (!response.ok) return null;
         const data = (await response.json()) as ShopifyAppSettings;
@@ -719,7 +1553,7 @@ export default function App() {
 
     async function loadMetaConnection() {
       try {
-        const response = await fetch("/api/integrations/meta/status");
+        const response = await apiFetch("/api/integrations/meta/status");
         setBackendOffline(false);
         if (!response.ok) return null;
         const data = (await response.json()) as {
@@ -756,7 +1590,7 @@ export default function App() {
 
     async function loadMetaAppSettings() {
       try {
-        const response = await fetch("/api/settings/meta-app");
+        const response = await apiFetch("/api/settings/meta-app");
         setBackendOffline(false);
         if (!response.ok) return null;
         const data = (await response.json()) as MetaAppSettings;
@@ -769,10 +1603,25 @@ export default function App() {
       }
     }
 
+    async function loadZendropSettings() {
+      try {
+        const response = await apiFetch("/api/settings/zendrop");
+        setBackendOffline(false);
+        if (!response.ok) return null;
+        const data = (await response.json()) as ZendropAppSettings;
+        setZendropAppSettings(data);
+        return data;
+      } catch {
+        setBackendOffline(true);
+        setZendropAppSettings(null);
+        return null;
+      }
+    }
+
     async function loadShopifyBranding() {
       try {
         const query = shop ? `?shop=${encodeURIComponent(shop)}` : "";
-        const response = await fetch(`/api/branding/shopify${query}`);
+        const response = await apiFetch(`/api/branding/shopify${query}`);
         setBackendOffline(false);
         if (!response.ok) return null;
         const data = (await response.json()) as ShopifyBranding;
@@ -787,7 +1636,7 @@ export default function App() {
 
     async function loadUiSettings() {
       try {
-        const response = await fetch("/api/settings/ui");
+        const response = await apiFetch("/api/settings/ui");
         setBackendOffline(false);
         if (!response.ok) return null;
         const data = (await response.json()) as UiSettings;
@@ -811,11 +1660,14 @@ export default function App() {
     }
 
     async function bootstrap() {
+      await loadProfileState(currentUserEmail);
+      setProfileStateReady(true);
       const [connection, settings] = await Promise.all([
         loadShopifyConnection(),
         loadShopifyAppSettings(),
         loadMetaConnection(),
         loadMetaAppSettings(),
+        loadZendropSettings(),
         loadShopifyBranding(),
         loadUiSettings(),
       ]);
@@ -829,12 +1681,12 @@ export default function App() {
         connection?.status !== "connected" &&
         status !== "connected"
       ) {
-        window.location.href = `/api/shopify/install?shop=${encodeURIComponent(shop)}`;
+        window.location.href = `/api/shopify/install?shop=${encodeURIComponent(shop)}&profileEmail=${encodeURIComponent(currentUserEmail)}`;
       }
     }
 
     void bootstrap();
-  }, []);
+  }, [currentUserEmail]);
 
   useEffect(() => {
     window.localStorage.setItem("shopify-display-currency", shopifyDisplayCurrency);
@@ -875,13 +1727,31 @@ export default function App() {
   }, [dailyAdBudget]);
 
   useEffect(() => {
+    if (!currentUserEmail || !profileStateReady) return;
+    void syncProfileState().catch(() => undefined);
+  }, [
+    currentUserEmail,
+    profileStateReady,
+    mappings,
+    adAnnotations,
+    zendropOrderCosts,
+    ruleSettings,
+    dailyAdBudget,
+    shopifyDisplayCurrency,
+    usdToAudRate,
+    usdToAudRateUpdatedAt,
+    usdToAudRateSource,
+    dateRange,
+  ]);
+
+  useEffect(() => {
     let active = true;
 
     async function loadGrowthData() {
       try {
         const [shopifyResponse, metaResponse] = await Promise.all([
-          fetch(`/api/imports/shopify/products?${dateRangeKey}`, { cache: "no-store" }),
-          fetch(`/api/imports/meta-ads?${dateRangeKey}`, { cache: "no-store" }),
+          apiFetch(`/api/imports/shopify/products?${dateRangeKey}`, { cache: "no-store" }),
+          apiFetch(`/api/imports/meta-ads?${dateRangeKey}`, { cache: "no-store" }),
         ]);
 
         if (shopifyResponse.ok) {
@@ -910,8 +1780,8 @@ export default function App() {
   );
   const metaOperatingCurrency = normalizeCurrencyCode(metaConnection.currency, OPERATING_CURRENCY);
   const baseGrowthProducts = useMemo(
-    () => buildGrowthProducts(growthShopifyProducts, ruleSettings, usdToAudRate),
-    [growthShopifyProducts, ruleSettings, usdToAudRate],
+    () => buildGrowthProducts(growthShopifyProducts, zendropOrderCosts, ruleSettings, usdToAudRate),
+    [growthShopifyProducts, zendropOrderCosts, ruleSettings, usdToAudRate],
   );
   const growthAds = useMemo(
     () =>
@@ -933,24 +1803,70 @@ export default function App() {
   const effectiveBrandColor = uiSettings.appColor || shopifyBranding?.primaryColor || "";
   const effectiveLogoUrl = uiSettings.logoUrl || shopifyBranding?.logoUrl || "";
 
+  if (!currentUserEmail) {
+    return (
+      <div style={brandingStyle(effectiveBrandColor)}>
+        <LoginPage
+          email={loginEmail}
+          notice={authNotice}
+          onEmailChange={setLoginEmail}
+          onSubmit={loginWithEmail}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell" style={brandingStyle(effectiveBrandColor)}>
       <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark">
-            {effectiveLogoUrl ? (
-                <img
-                  className="brand-mark-image"
-                  src={effectiveLogoUrl}
-                  alt={shopifyBranding?.shopName || "Store logo"}
-                />
-            ) : (
-              "G"
-            )}
-          </span>
-          <div>
-            <strong>GrowthOS</strong>
-            <span>{shopifyBranding?.shopName || "Insidecats"}</span>
+        <div className="brand-block">
+          <strong className="brand-title">GrowthOS</strong>
+          <div className="brand-menu-wrap">
+            <button
+              className="brand brand-button"
+              type="button"
+              onClick={() => setIsAccountMenuOpen((current) => !current)}
+              aria-expanded={isAccountMenuOpen}
+              aria-haspopup="menu"
+            >
+              <span className="brand-mark brand-mark-circle">
+                {effectiveLogoUrl ? (
+                  <img
+                    className="brand-mark-image"
+                    src={effectiveLogoUrl}
+                    alt={shopifyBranding?.shopName || "Store logo"}
+                  />
+                ) : (
+                  "G"
+                )}
+              </span>
+              <span className="brand-copy">
+                <span>{shopifyBranding?.shopName || "Insidecats"}</span>
+                <small>{currentUserEmail}</small>
+              </span>
+              <span className="brand-action" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path
+                    d="m6 9 6 6 6-6"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="2"
+                  />
+                </svg>
+              </span>
+            </button>
+            {isAccountMenuOpen ? (
+              <div className="account-menu" role="menu" aria-label="Account actions">
+                <button className="account-menu-item" type="button" role="menuitem" onClick={switchAccount}>
+                  Switch account
+                </button>
+                <button className="account-menu-item" type="button" role="menuitem" onClick={logout}>
+                  Log out
+                </button>
+              </div>
+            ) : null}
           </div>
         </div>
         <button
@@ -993,93 +1909,93 @@ export default function App() {
           </div>
           <section className="sidebar-settings">
             <div className="sidebar-panel">
-            <button
-              className="sidebar-panel-toggle"
-              type="button"
-              aria-expanded={isRangeOpen}
-              aria-controls="reporting-range-panel"
-              onClick={() => setIsRangeOpen((current) => !current)}
-            >
-              <span className="sidebar-panel-header">
-                <strong>Reporting range</strong>
-                <span>{formatRangeLabel(dateRange)}</span>
-              </span>
-              <span className={`sidebar-panel-chevron ${isRangeOpen ? "open" : ""}`} aria-hidden="true">
-                <svg viewBox="0 0 24 24">
-                  <path
-                    d="m6 9 6 6 6-6"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="2"
-                  />
-                </svg>
-              </span>
-            </button>
-            {isRangeOpen ? (
-              <div id="reporting-range-panel" className="sidebar-panel-body">
-                <div className="range-chip-grid">
-                  {[
-                    { value: "7d", label: "Last 7 days" },
-                    { value: "30d", label: "Last 30 days" },
-                    { value: "all", label: "All time" },
-                    { value: "month", label: "This month" },
-                  ].map((option) => (
-                    <button
-                      key={option.value}
-                      className={`scope-chip ${dateRange.preset === option.value ? "scope-chip-selected" : ""}`}
-                      type="button"
-                      onClick={() =>
-                        setDateRange(createPresetRange(option.value as Exclude<DateRangePreset, "custom">))
-                      }
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="date-range-grid">
-                  <div>
-                    <label htmlFor="range-start-date">Start date</label>
-                    <input
-                      id="range-start-date"
-                      type="date"
-                      value={dateRange.startDate}
-                      max={dateRange.endDate}
-                      onChange={(event) =>
-                        setDateRange((current) => {
-                          const nextStart = event.target.value;
-                          return normalizeDateRange({
-                            preset: "custom",
-                            startDate: nextStart,
-                            endDate: nextStart > current.endDate ? nextStart : current.endDate,
-                          });
-                        })
-                      }
+              <button
+                className="sidebar-panel-toggle"
+                type="button"
+                aria-expanded={isRangeOpen}
+                aria-controls="reporting-range-panel"
+                onClick={() => setIsRangeOpen((current) => !current)}
+              >
+                <span className="sidebar-panel-header">
+                  <strong>Reporting range</strong>
+                  <span>{formatRangeLabel(dateRange)}</span>
+                </span>
+                <span className={`sidebar-panel-chevron ${isRangeOpen ? "open" : ""}`} aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <path
+                      d="m6 9 6 6 6-6"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="2"
                     />
+                  </svg>
+                </span>
+              </button>
+              {isRangeOpen ? (
+                <div id="reporting-range-panel" className="sidebar-panel-body">
+                  <div className="range-chip-grid">
+                    {[
+                      { value: "7d", label: "Last 7 days" },
+                      { value: "30d", label: "Last 30 days" },
+                      { value: "all", label: "All time" },
+                      { value: "month", label: "This month" },
+                    ].map((option) => (
+                      <button
+                        key={option.value}
+                        className={`scope-chip ${dateRange.preset === option.value ? "scope-chip-selected" : ""}`}
+                        type="button"
+                        onClick={() =>
+                          setDateRange(createPresetRange(option.value as Exclude<DateRangePreset, "custom">))
+                        }
+                      >
+                        {option.label}
+                      </button>
+                    ))}
                   </div>
-                  <div>
-                    <label htmlFor="range-end-date">End date</label>
-                    <input
-                      id="range-end-date"
-                      type="date"
-                      value={dateRange.endDate}
-                      min={dateRange.startDate}
-                      max={localDateString()}
-                      onChange={(event) =>
-                        setDateRange((current) =>
-                          normalizeDateRange({
-                            preset: "custom",
-                            startDate: current.startDate,
-                            endDate: event.target.value,
-                          }),
-                        )
-                      }
-                    />
+                  <div className="date-range-grid">
+                    <div>
+                      <label htmlFor="range-start-date">Start date</label>
+                      <input
+                        id="range-start-date"
+                        type="date"
+                        value={dateRange.startDate}
+                        max={dateRange.endDate}
+                        onChange={(event) =>
+                          setDateRange((current) => {
+                            const nextStart = event.target.value;
+                            return normalizeDateRange({
+                              preset: "custom",
+                              startDate: nextStart,
+                              endDate: nextStart > current.endDate ? nextStart : current.endDate,
+                            });
+                          })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="range-end-date">End date</label>
+                      <input
+                        id="range-end-date"
+                        type="date"
+                        value={dateRange.endDate}
+                        min={dateRange.startDate}
+                        max={localDateString()}
+                        onChange={(event) =>
+                          setDateRange((current) =>
+                            normalizeDateRange({
+                              preset: "custom",
+                              startDate: current.startDate,
+                              endDate: event.target.value,
+                            }),
+                          )
+                        }
+                      />
+                    </div>
                   </div>
                 </div>
-              </div>
-            ) : null}
+              ) : null}
             </div>
           </section>
         </div>
@@ -1148,6 +2064,16 @@ export default function App() {
             navigate={navigate}
             ruleSettings={ruleSettings}
             setRuleSettings={setRuleSettings}
+          />
+        ) : null}
+        {path === "/settings/zendrop" ? (
+          <ZendropCostsSettingsPage
+            navigate={navigate}
+            initialSettings={zendropAppSettings}
+            setZendropAppSettings={setZendropAppSettings}
+            orders={zendropOrderCosts}
+            setOrders={setZendropOrderCosts}
+            products={growthProducts}
           />
         ) : null}
         {path === "/settings/integrations" ? (
@@ -1228,7 +2154,13 @@ export default function App() {
           <AdsPage
             ads={growthAds}
             products={growthProducts}
+            mappings={reconciledMappings}
+            setMappings={setMappings}
+            adAnnotations={adAnnotations}
+            setAdAnnotations={setAdAnnotations}
             ruleSettings={ruleSettings}
+            navigate={navigate}
+            dateRange={dateRange}
             displayCurrency={shopifyDisplayCurrency}
             usdToAudRate={usdToAudRate}
           />
@@ -1331,6 +2263,15 @@ function DashboardPage({
       label: "Revenue",
       value: formatDisplayMoney(
         businessSummary.totalRevenue,
+        OPERATING_CURRENCY,
+        shopifyDisplayCurrency,
+        usdToAudRate,
+      ),
+    },
+    {
+      label: "Zendrop landed cost",
+      value: formatDisplayMoney(
+        businessSummary.totalZendropLandedCost || 0,
         OPERATING_CURRENCY,
         shopifyDisplayCurrency,
         usdToAudRate,
@@ -1477,9 +2418,16 @@ function DashboardPage({
           return (
             <article className="card product-decision-card" key={product.id}>
               <div className="product-decision-header">
-                <div>
+                <div className="product-decision-title">
+                  <ProductVisual
+                    name={product.name}
+                    imageUrl={product.productImageUrl}
+                    size="md"
+                  />
+                  <div>
                   <p className="product-decision-role">{product.role}</p>
                   <h2>{product.name}</h2>
+                  </div>
                 </div>
                 <div className="product-decision-badges">
                   <span className="status connected">{product.status}</span>
@@ -1858,6 +2806,13 @@ function SettingsHubPage({
       tone: "connected",
     },
     {
+      title: "Zendrop Costs",
+      description: "Connect a Zendrop access token and sync landed product plus shipping costs directly into profitability.",
+      href: "/settings/zendrop",
+      badge: "API sync",
+      tone: "connected",
+    },
+    {
       title: "App Setup",
       description: "Manage Shopify and Meta credentials, scopes, and callback URLs.",
       href: "/settings/app-setup",
@@ -1978,7 +2933,7 @@ function BrandingSettingsPage({
 
   async function saveUiSettings(next: { appColor: string; logoUrl: string }) {
     try {
-      const response = await fetch("/api/settings/ui", {
+      const response = await apiFetch("/api/settings/ui", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(next),
@@ -2238,10 +3193,20 @@ function RulesSettingsPage({
         rules={[
           ["requiredAdsBeforeProductJudgment", "Required ads before judgment", "Minimum tested ads before product judgment."],
           ["requiredAnglesBeforeProductJudgment", "Required angles before judgment", "Minimum tested angles before product judgment."],
+          ["requiredFormatsBeforeProductJudgment", "Required formats before judgment", "Minimum tested creative formats before product judgment."],
           ["productTestBudgetCap", "Product test budget cap", "Maximum product test spend before a stronger decision."],
           ["certifyProductMinPurchases", "Certify minimum purchases", "Purchases needed before certification can be recommended."],
           ["certifyProductCpaMultiplier", "Certify CPA multiplier", "Product can certify at or below this multiple of break-even CPA."],
           ["killProductCpaMultiplier", "Kill CPA multiplier", "Product can be killed above this CPA multiple after test completion."],
+        ]}
+        values={draft}
+        onChange={setRule}
+      />
+      <RuleSection
+        title="Ad Test Quality Rules"
+        rules={[
+          ["minimumAdImpressionsForCtrJudgment", "Minimum impressions for CTR judgment", "Below this, CTR should not drive a strong recut decision."],
+          ["minimumAdClicksForFunnelJudgment", "Minimum clicks for funnel judgment", "Below this, clicks are usually too noisy for a strong product conclusion."],
         ]}
         values={draft}
         onChange={setRule}
@@ -2289,7 +3254,13 @@ function RuleSection({
             <span className="settings-brand-label">{label}</span>
             <input
               type="number"
-              min={key === "requiredAdsBeforeProductJudgment" || key === "requiredAnglesBeforeProductJudgment" ? 1 : 0}
+              min={
+                key === "requiredAdsBeforeProductJudgment" ||
+                key === "requiredAnglesBeforeProductJudgment" ||
+                key === "requiredFormatsBeforeProductJudgment"
+                  ? 1
+                  : 0
+              }
               step={key.toLowerCase().includes("percent") || key.toLowerCase().includes("threshold") ? 0.1 : 1}
               value={values[key]}
               onChange={(event) => onChange(key, Number(event.target.value))}
@@ -2299,6 +3270,292 @@ function RuleSection({
         ))}
       </div>
     </article>
+  );
+}
+
+function ZendropCostsSettingsPage({
+  navigate,
+  initialSettings,
+  setZendropAppSettings,
+  orders,
+  setOrders,
+  products,
+}: {
+  navigate: (href: string) => void;
+  initialSettings: ZendropAppSettings | null;
+  setZendropAppSettings: Dispatch<SetStateAction<ZendropAppSettings | null>>;
+  orders: ZendropOrderCost[];
+  setOrders: Dispatch<SetStateAction<ZendropOrderCost[]>>;
+  products: Product[];
+}) {
+  const [csvText, setCsvText] = useState("");
+  const [accessToken, setAccessToken] = useState(initialSettings?.accessToken || "");
+  const [scopes, setScopes] = useState(initialSettings?.scopes || "orders:read,stores:read");
+  const [showSecret, setShowSecret] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [notice, setNotice] = useState("");
+  const matchedProducts = new Set(
+    orders.map((order) => slugify(order.productName)).filter((slug) =>
+      products.some((product) => product.id === slug || slugify(product.shopifyProductTitle || "") === slug),
+    ),
+  ).size;
+
+  useEffect(() => {
+    setAccessToken(initialSettings?.accessToken || "");
+    setScopes(initialSettings?.scopes || "orders:read,stores:read");
+  }, [initialSettings?.accessToken, initialSettings?.scopes]);
+
+  function handleFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") setCsvText(reader.result);
+    };
+    reader.readAsText(file);
+    event.target.value = "";
+  }
+
+  function importCsv() {
+    const parsed = parseZendropCsv(csvText);
+    setOrders(parsed.orders);
+    setNotice(
+      parsed.orders.length
+        ? `Imported ${parsed.summary.importedRows} Zendrop rows.`
+        : "No valid Zendrop rows were detected. Check the CSV headers.",
+    );
+  }
+
+  function clearImport() {
+    setOrders([]);
+    setCsvText("");
+    setNotice("Zendrop costs cleared.");
+  }
+
+  async function saveSettings(event: FormEvent) {
+    event.preventDefault();
+    setIsSaving(true);
+    setNotice("");
+    try {
+      const response = await apiFetch("/api/settings/zendrop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accessToken,
+          scopes,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setNotice(data.error || "Could not save Zendrop settings.");
+        return;
+      }
+      setZendropAppSettings(data);
+      setAccessToken(data.accessToken || "");
+      setScopes(data.scopes || "orders:read,stores:read");
+      setNotice(data.storeName ? `Zendrop connected to ${data.storeName}.` : "Zendrop token saved.");
+    } catch {
+      setNotice("Could not save Zendrop settings.");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function syncZendrop() {
+    setIsSyncing(true);
+    setNotice("");
+    try {
+      const response = await apiFetch("/api/imports/zendrop/sync", {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setNotice(data.error || "Could not sync Zendrop orders.");
+        return;
+      }
+      setOrders(Array.isArray(data.orders) ? data.orders : []);
+      setZendropAppSettings((current) =>
+        current
+          ? {
+              ...current,
+              storeName: data.storeName || current.storeName,
+              storeUrl: data.storeUrl || current.storeUrl,
+              lastSyncAt: data.lastSyncAt || current.lastSyncAt,
+              status: data.storeName || current.storeName ? "connected" : current.status,
+            }
+          : current,
+      );
+      setNotice(
+        data.importedRows
+          ? `Synced ${data.importedRows} Zendrop landed-cost rows from ${data.orderCount || 0} orders.`
+          : "Zendrop connected, but no landed-cost rows were returned from the API.",
+      );
+    } catch {
+      setNotice("Could not sync Zendrop orders.");
+    } finally {
+      setIsSyncing(false);
+    }
+  }
+
+  const zendropStatusTone =
+    initialSettings?.status === "connected"
+      ? "connected"
+      : initialSettings?.configured
+        ? "not_connected"
+        : "not_connected";
+  const zendropStatusLabel =
+    initialSettings?.status === "connected"
+      ? "Connected"
+      : initialSettings?.configured
+        ? "Configured"
+        : "Not Configured";
+
+  return (
+    <section className="page settings-home">
+      <SettingsSubpageHeader
+        navigate={navigate}
+        title="Zendrop Costs"
+        currentLabel="Zendrop Costs"
+        description="Connect Zendrop once, then sync landed product plus shipping costs directly into GrowthOS profitability."
+      />
+
+      {notice ? <p className="notice">{notice}</p> : null}
+
+      <article className="card setup-card">
+        <div className="card-title-row">
+          <h2>Zendrop API connection</h2>
+          <span className={`status ${zendropStatusTone}`}>
+            {zendropStatusLabel}
+          </span>
+        </div>
+        <p className="muted">
+          Zendrop’s current developer docs expose the MCP endpoint and actions, so this connects with an access token and syncs landed costs into the same product matching flow already used by the dashboard.
+        </p>
+        <form className="setup-form" onSubmit={saveSettings}>
+          <label htmlFor="zendrop-access-token">Zendrop access token</label>
+          <div className="secret-input">
+            <input
+              id="zendrop-access-token"
+              type={showSecret ? "text" : "password"}
+              value={accessToken}
+              onChange={(event) => setAccessToken(event.target.value)}
+              placeholder="Enter Zendrop access token"
+            />
+            <button
+              aria-label={showSecret ? "Hide Zendrop access token" : "Show Zendrop access token"}
+              className="btn btn-secondary btn-icon icon-button"
+              type="button"
+              onClick={() => setShowSecret((current) => !current)}
+            >
+              {showSecret ? (
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M3 4.5 19.5 21"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.8"
+                  />
+                  <path
+                    d="M10.7 6.1A9.8 9.8 0 0 1 12 6c5.3 0 9.3 4.3 10 6-.3.8-1.4 2.4-3.1 3.8M14.8 16.7A4 4 0 0 1 8 12.2M6.1 8.7C4.5 10 3.4 11.4 3 12c.7 1.7 4.7 6 10 6 .5 0 1 0 1.5-.1"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.8"
+                  />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12Z"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.8"
+                  />
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="3"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                  />
+                </svg>
+              )}
+            </button>
+          </div>
+
+          <label htmlFor="zendrop-scopes">Scopes</label>
+          <input
+            id="zendrop-scopes"
+            value={scopes}
+            onChange={(event) => setScopes(event.target.value)}
+            placeholder="orders:read,stores:read"
+          />
+
+          <div className="button-row">
+            <button className="btn btn-primary" type="submit" disabled={isSaving}>
+              {isSaving ? "Saving..." : "Save Zendrop Token"}
+            </button>
+            <button
+              className="btn btn-secondary"
+              type="button"
+              onClick={syncZendrop}
+              disabled={isSyncing || !initialSettings?.configured}
+            >
+              {isSyncing ? "Syncing..." : "Sync Zendrop Orders"}
+            </button>
+          </div>
+        </form>
+
+        <div className="summary-list">
+          <div><strong>{initialSettings?.storeName || "Not linked"}</strong><span>Connected store</span></div>
+          <div><strong>{initialSettings?.lastSyncAt ? new Date(initialSettings.lastSyncAt).toLocaleString() : "Never"}</strong><span>Last API sync</span></div>
+          <div><strong>{orders.length}</strong><span>Imported Zendrop rows</span></div>
+          <div><strong>{matchedProducts}</strong><span>Matched products</span></div>
+          <div><strong>{formatDisplayMoney(orders.reduce((sum, row) => sum + row.totalCost, 0), "USD", "USD", 1)}</strong><span>Total imported landed cost (source currency)</span></div>
+        </div>
+        {initialSettings?.storeUrl ? (
+          <p className="muted">Store URL: {initialSettings.storeUrl}</p>
+        ) : null}
+      </article>
+
+      <article className="card settings-color-card">
+        <div className="card-title-row">
+          <h2>CSV fallback</h2>
+          <span className="status not_connected">Optional</span>
+        </div>
+        <p className="muted">
+          If Zendrop’s MCP response shape changes or your token lacks order-cost access, you can still import a CSV export as a fallback.
+        </p>
+        <label className="logo-upload-field">
+          <input type="file" accept=".csv,text/csv" onChange={handleFile} />
+          <span>Upload Zendrop CSV</span>
+        </label>
+        <textarea
+          rows={10}
+          value={csvText}
+          onChange={(event) => setCsvText(event.target.value)}
+          placeholder="Paste Zendrop CSV here"
+        />
+        <div className="button-row">
+          <button className="btn btn-secondary" type="button" onClick={importCsv}>
+            Import CSV Instead
+          </button>
+          <button className="btn btn-secondary" type="button" onClick={clearImport}>
+            Clear Imported Costs
+          </button>
+        </div>
+        <p className="muted">
+          Supported CSV headers include `order_number`, `product_name`, `quantity`, `product_cost`, `shipping_cost`, and `total_cost`.
+        </p>
+      </article>
+    </section>
   );
 }
 
@@ -2391,7 +3648,7 @@ function ShopifyAppSetupPage({
       );
 
     try {
-      const response = await fetch("/api/settings/shopify-app", {
+      const response = await apiFetch("/api/settings/shopify-app", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2409,7 +3666,7 @@ function ShopifyAppSetupPage({
         return;
       }
 
-      const statusResponse = await fetch("/api/settings/shopify-app");
+      const statusResponse = await apiFetch("/api/settings/shopify-app");
       if (!statusResponse.ok) return;
       const data = (await statusResponse.json()) as ShopifyAppSettings;
       setShopifyAppSettings(data);
@@ -2419,9 +3676,9 @@ function ShopifyAppSetupPage({
         setNotice("Shopify app settings saved. Reinstalling Shopify app now...");
         window.setTimeout(() => {
           if (data.defaultShopDomain) {
-            window.location.href = `/api/shopify/install?shop=${encodeURIComponent(
-              data.defaultShopDomain,
-            )}`;
+            window.location.href = buildProfileInstallPath(
+              `/api/shopify/install?shop=${encodeURIComponent(data.defaultShopDomain)}`,
+            );
             return;
           }
 
@@ -2441,7 +3698,7 @@ function ShopifyAppSetupPage({
   async function saveMetaSettings(event: FormEvent) {
     event.preventDefault();
     try {
-      const response = await fetch("/api/settings/meta-app", {
+      const response = await apiFetch("/api/settings/meta-app", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2458,7 +3715,7 @@ function ShopifyAppSetupPage({
         return;
       }
 
-      const statusResponse = await fetch("/api/settings/meta-app");
+      const statusResponse = await apiFetch("/api/settings/meta-app");
       if (!statusResponse.ok) return;
       const data = (await statusResponse.json()) as MetaAppSettings;
       setMetaAppSettings(data);
@@ -2774,7 +4031,9 @@ function IntegrationsPage({
       return;
     }
 
-    window.location.href = `/api/shopify/install?shop=${encodeURIComponent(normalized)}`;
+    window.location.href = buildProfileInstallPath(
+      `/api/shopify/install?shop=${encodeURIComponent(normalized)}`,
+    );
   }
 
   function connectMeta() {
@@ -2783,13 +4042,13 @@ function IntegrationsPage({
       return;
     }
 
-    window.location.href = "/api/meta/connect";
+    window.location.href = buildProfileInstallPath("/api/meta/connect");
   }
 
   async function disconnect(provider: IntegrationProvider) {
     if (provider === "shopify") {
       try {
-        const response = await fetch("/api/integrations/shopify/disconnect", {
+        const response = await apiFetch("/api/integrations/shopify/disconnect", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ shop: shopifyConnection.storeDomain }),
@@ -2805,7 +4064,7 @@ function IntegrationsPage({
     }
     if (provider === "meta-ads") {
       try {
-        const response = await fetch("/api/integrations/meta/disconnect", {
+        const response = await apiFetch("/api/integrations/meta/disconnect", {
           method: "POST",
         });
         if (!response.ok) {
@@ -3009,7 +4268,7 @@ function ShopifyImportsPage({
       setError("");
 
       try {
-        const response = await fetch(`/api/imports/shopify/products?${rangeQuery}`, {
+        const response = await apiFetch(`/api/imports/shopify/products?${rangeQuery}`, {
           cache: "no-store",
         });
         const data = (await response.json()) as {
@@ -3093,18 +4352,11 @@ function ShopifyImportsPage({
               <tr key={product.shopifyProductId}>
                 <td>
                   <div className="product-cell">
-                    {product.productImageUrl ? (
-                      <img
-                        className="product-thumb"
-                        src={product.productImageUrl}
-                        alt={product.productTitle}
-                        loading="lazy"
-                      />
-                    ) : (
-                      <div className="product-thumb product-thumb-fallback" aria-hidden="true">
-                        {product.productTitle.slice(0, 1).toUpperCase()}
-                      </div>
-                    )}
+                    <ProductVisual
+                      name={product.productTitle}
+                      imageUrl={product.productImageUrl}
+                      size="sm"
+                    />
                     <div className="product-meta">
                       <strong>{product.productTitle}</strong>
                     </div>
@@ -3176,7 +4428,7 @@ function MetaAdsImportsPage({
       if (!background && !hasLoadedData) setLoading(true);
       setError("");
       try {
-        const response = await fetch(`/api/imports/meta-ads?${rangeQuery}`, {
+        const response = await apiFetch(`/api/imports/meta-ads?${rangeQuery}`, {
           cache: "no-store",
         });
         const data = (await response.json()) as {
@@ -3255,10 +4507,14 @@ function MetaAdsImportsPage({
         <table>
           <thead>
             <tr>
+              <th>Creative</th>
+              <th>Objective</th>
               <th>Campaign name</th>
               <th>Ad set name</th>
               <th>Ad name</th>
               <th>Meta ad ID</th>
+              <th>Active days</th>
+              <th>Active range</th>
               <th>Spend</th>
               <th>Impressions</th>
               <th>Clicks</th>
@@ -3271,10 +4527,23 @@ function MetaAdsImportsPage({
           <tbody>
             {ads.map((ad) => (
               <tr key={ad.metaAdId}>
+                <td>
+                  <AdCreativeVisual
+                    name={ad.adName}
+                    imageUrl={ad.creativeImageUrl || ad.creativeThumbnailUrl}
+                    posterUrl={ad.creativeThumbnailUrl || ad.creativeImageUrl}
+                    videoUrl={ad.creativeVideoUrl}
+                    type={ad.creativeType}
+                    size="sm"
+                  />
+                </td>
+                <td>{ad.objectiveLabel || "Not set"}</td>
                 <td>{ad.campaignName}</td>
                 <td>{ad.adSetName}</td>
                 <td>{ad.adName}</td>
                 <td>{ad.metaAdId}</td>
+                <td>{ad.activeDays || 0}</td>
+                <td>{formatActiveRange(ad.firstActiveDate, ad.lastActiveDate)}</td>
                 <td>
                   {formatDisplayMoney(ad.spend, metaCurrency, displayCurrency, usdToAudRate)}
                 </td>
@@ -3314,8 +4583,17 @@ function MappingsPage({
   usdToAudRate,
   metaCurrency,
 }: MappingsPageProps) {
+  const highlightedAdId = new URLSearchParams(window.location.search).get("ad") || "";
   const productById = new Map(products.map((product) => [product.id, product]));
   const mappingByAdId = new Map(mappings.map((mapping) => [mapping.metaAdId, mapping]));
+
+  useEffect(() => {
+    if (!highlightedAdId) return;
+    const row = document.querySelector(`[data-ad-id="${CSS.escape(highlightedAdId)}"]`);
+    if (row instanceof HTMLElement) {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [highlightedAdId]);
 
   function assign(metaAdId: string, productId?: string) {
     setMappings((current) => {
@@ -3374,7 +4652,11 @@ function MappingsPage({
               const detection = detectProductForAd(ad);
               const detectedProduct = detection.productId ? productById.get(detection.productId)?.name : "Manual required";
               return (
-              <tr key={ad.metaAdId}>
+              <tr
+                key={ad.metaAdId}
+                data-ad-id={ad.metaAdId}
+                className={highlightedAdId === ad.metaAdId ? "table-row-highlighted" : ""}
+              >
                 <td>{ad.adName}</td>
                 <td>{ad.campaignName}</td>
                 <td>{ad.adSetName}</td>
@@ -3447,6 +4729,11 @@ function ProductsPage({
   displayCurrency: ShopifyDisplayCurrency;
   usdToAudRate: number;
 }) {
+  const sortedProducts = [...products].sort((first, second) => {
+    const roleOrder = { Hero: 0, Challenger: 1, Test: 2, Backlog: 3 } as const;
+    return roleOrder[first.role] - roleOrder[second.role] || second.totalSpend - first.totalSpend;
+  });
+
   return (
     <section className="page">
       <header className="page-header">
@@ -3454,53 +4741,83 @@ function ProductsPage({
         <h1>Products</h1>
         <p>Product testing state, assigned Meta spend, Shopify revenue, and rule-based recommendations.</p>
       </header>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Product</th>
-              <th>Role</th>
-              <th>Status</th>
-              <th>Shopify linked</th>
-              <th>Assigned spend</th>
-              <th>Revenue</th>
-              <th>Purchases</th>
-              <th>CPA</th>
-              <th>Break-even CPA</th>
-              <th>Ads tested</th>
-              <th>Test progress</th>
-              <th>Decision</th>
-              <th>Next action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {products.map((product) => {
-              const assignedAds = ads.filter((ad) => ad.productId === product.id);
-              const decision = getProductDecision(product, assignedAds, ruleSettings);
-              return (
-                <tr key={product.id}>
-                  <td>
-                    <button className="table-link" onClick={() => navigate(`/products/${encodeURIComponent(product.id)}`)}>
-                      {product.name}
-                    </button>
-                  </td>
-                  <td>{product.role}</td>
-                  <td>{product.status}</td>
-                  <td>{product.shopifyProductId ? "Yes" : "No"}</td>
-                  <td>{formatDisplayMoney(product.totalSpend, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}</td>
-                  <td>{formatDisplayMoney(product.revenue, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}</td>
-                  <td>{product.purchases}</td>
-                  <td>{product.currentCpa ? formatDisplayMoney(product.currentCpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate) : "—"}</td>
-                  <td>{formatDisplayMoney(product.breakEvenCpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}</td>
-                  <td>{product.adsTestedCount} / {product.requiredAdsBeforeJudgment}</td>
-                  <td>{Math.min(100, Math.round((product.totalSpend / Math.max(1, product.testBudgetCap)) * 100))}% budget</td>
-                  <td><span className="status connected">{decision}</span></td>
-                  <td>{product.nextAction}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div className="products-card-grid">
+        {sortedProducts.map((product) => {
+          const assignedAds = ads.filter((ad) => ad.productId === product.id);
+          const decision = getProductDecision(product, assignedAds, ruleSettings);
+          const spendProgress = Math.min(100, Math.round((product.totalSpend / Math.max(1, product.testBudgetCap)) * 100));
+          return (
+            <article className="card product-overview-card" key={product.id}>
+              <div className="product-overview-header">
+                <div className="product-decision-title">
+                  <ProductVisual
+                    name={product.name}
+                    imageUrl={product.productImageUrl}
+                    size="md"
+                  />
+                  <div>
+                    <p className="product-decision-role">{product.role}</p>
+                    <h2>{product.name}</h2>
+                    <p className="product-overview-linkage">
+                      {product.shopifyProductId ? "Linked to Shopify" : "No Shopify product linked"}
+                    </p>
+                  </div>
+                </div>
+                <div className="product-decision-badges">
+                  <span className="status connected">{product.status}</span>
+                  <span className="status not_connected">{decision}</span>
+                </div>
+              </div>
+
+              <div className="decision-metric-grid product-overview-metrics">
+                <MetricStat
+                  label="Assigned spend"
+                  value={formatDisplayMoney(product.totalSpend, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}
+                />
+                <MetricStat
+                  label="Revenue"
+                  value={formatDisplayMoney(product.revenue, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}
+                />
+                <MetricStat
+                  label="Purchases"
+                  value={String(product.purchases)}
+                />
+                <MetricStat
+                  label="Current CPA"
+                  value={product.currentCpa ? formatDisplayMoney(product.currentCpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate) : "—"}
+                />
+                <MetricStat
+                  label="Break-even CPA"
+                  value={formatDisplayMoney(product.breakEvenCpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}
+                />
+                <MetricStat
+                  label="Ads tested"
+                  value={`${product.adsTestedCount} / ${product.requiredAdsBeforeJudgment}`}
+                />
+              </div>
+
+              <div className="product-overview-summary">
+                <div className="product-overview-summary-row">
+                  <strong>Test progress</strong>
+                  <span>{spendProgress}% of budget cap used</span>
+                </div>
+                <div className="progress-track">
+                  <span className="progress-fill" style={{ width: `${spendProgress}%` }} />
+                </div>
+                <p>{product.nextAction}</p>
+              </div>
+
+              <div className="button-row">
+                <button className="btn btn-secondary" onClick={() => navigate(`/products/${encodeURIComponent(product.id)}`)}>
+                  View Details
+                </button>
+                <button className="btn btn-ghost" onClick={() => navigate("/ads")}>
+                  View Ads
+                </button>
+              </div>
+            </article>
+          );
+        })}
       </div>
     </section>
   );
@@ -3509,67 +4826,1010 @@ function ProductsPage({
 function AdsPage({
   ads,
   products,
+  mappings,
+  setMappings,
+  adAnnotations,
+  setAdAnnotations,
   ruleSettings,
+  navigate,
+  dateRange,
   displayCurrency,
   usdToAudRate,
 }: {
   ads: GrowthAd[];
   products: Product[];
+  mappings: ProductAdMapping[];
+  setMappings: Dispatch<SetStateAction<ProductAdMapping[]>>;
+  adAnnotations: Record<string, AdAnnotation>;
+  setAdAnnotations: Dispatch<SetStateAction<Record<string, AdAnnotation>>>;
   ruleSettings: RuleSettings;
+  navigate: (href: string) => void;
+  dateRange: UniversalDateRange;
   displayCurrency: ShopifyDisplayCurrency;
   usdToAudRate: number;
 }) {
+  const initialProductFilter = new URLSearchParams(window.location.search).get("product") || "all";
+  const [selectedProductFilter, setSelectedProductFilter] = useState(initialProductFilter);
+  const [activeView, setActiveView] = useState<"needs-action" | "live" | "tested" | "abandoned" | "all">("needs-action");
+  const [editingAdId, setEditingAdId] = useState<string | null>(null);
+  const [editorFocusField, setEditorFocusField] = useState<{ adId: string; field: AdEditorField } | null>(null);
+  const [activeCreative, setActiveCreative] = useState<AdCreativeState | null>(null);
+  const [isProductMenuOpen, setIsProductMenuOpen] = useState(false);
   const productById = new Map(products.map((product) => [product.id, product]));
+  const sortedProducts = [...products].sort((first, second) => first.name.localeCompare(second.name));
+  const validProductFilters = useMemo(
+    () => new Set(["all", "unmapped", ...sortedProducts.map((product) => product.id)]),
+    [sortedProducts],
+  );
+  const normalizedProductFilter = validProductFilters.has(selectedProductFilter)
+    ? selectedProductFilter
+    : "all";
+
+  function assignProduct(metaAdId: string, productId?: string) {
+    setMappings((current) => {
+      const existing = current.find((mapping) => mapping.metaAdId === metaAdId);
+      const nextMapping: ProductAdMapping = {
+        id: existing?.id || `mapping-${metaAdId}`,
+        metaAdId,
+        productId,
+        confidence: productId ? "Manual" : existing?.confidence || "Low",
+        source: productId ? "Manual" : "Manual",
+        notes: existing?.notes,
+      };
+      return [
+        ...current.filter((mapping) => mapping.metaAdId !== metaAdId),
+        nextMapping,
+      ];
+    });
+  }
+
+  function updateAnnotation(metaAdId: string, patch: Partial<AdAnnotation>) {
+    setAdAnnotations((current) => {
+      const existing = current[metaAdId] || { metaAdId };
+      const next = { ...existing, ...patch, metaAdId } as AdAnnotation;
+      for (const [key, value] of Object.entries(next)) {
+        if (key !== "metaAdId" && (value === "" || value === undefined)) {
+          delete (next as Record<string, unknown>)[key];
+        }
+      }
+      if (Object.keys(next).length === 1) {
+        const trimmed = { ...current };
+        delete trimmed[metaAdId];
+        return trimmed;
+      }
+      return { ...current, [metaAdId]: next };
+    });
+  }
+
+  function resetAnnotation(metaAdId: string) {
+    setAdAnnotations((current) => {
+      const trimmed = { ...current };
+      delete trimmed[metaAdId];
+      return trimmed;
+    });
+  }
+
+  function openAdEditor(adId: string, field?: AdEditorField) {
+    setEditingAdId(adId);
+    setEditorFocusField(field ? { adId, field } : null);
+  }
+
+  function toggleAdEditor(adId: string) {
+    setEditingAdId((current) => {
+      const next = current === adId ? null : adId;
+      if (!next) setEditorFocusField(null);
+      return next;
+    });
+  }
+
+  const evaluatedAds = useMemo(() => {
+    return ads
+      .map((ad) => {
+        const product = ad.productId ? productById.get(ad.productId) : undefined;
+        return evaluateAdTest(ad, product, adAnnotations[ad.metaAdId || ad.id], ruleSettings);
+      })
+      .sort((first, second) => second.spend - first.spend);
+  }, [ads, productById, adAnnotations, ruleSettings]);
+
+  useEffect(() => {
+    if (selectedProductFilter === normalizedProductFilter) return;
+    setSelectedProductFilter(normalizedProductFilter);
+  }, [selectedProductFilter, normalizedProductFilter]);
+
+  useEffect(() => {
+    const nextUrl = new URL(window.location.href);
+    if (normalizedProductFilter === "all") nextUrl.searchParams.delete("product");
+    else nextUrl.searchParams.set("product", normalizedProductFilter);
+    window.history.replaceState(null, "", nextUrl.toString());
+  }, [normalizedProductFilter]);
+
+  useEffect(() => {
+    setIsProductMenuOpen(false);
+  }, [normalizedProductFilter]);
+
+  const selectedProduct =
+    normalizedProductFilter !== "all" && normalizedProductFilter !== "unmapped"
+      ? productById.get(normalizedProductFilter)
+      : undefined;
+  const selectedProductLabel = selectedProduct?.name || (normalizedProductFilter === "unmapped" ? "Unmapped Ads" : "All Products");
+
+  const scopedAds = useMemo(() => {
+    if (normalizedProductFilter === "all") return evaluatedAds;
+    if (normalizedProductFilter === "unmapped") return evaluatedAds.filter((ad) => !ad.productId);
+    return evaluatedAds.filter((ad) => ad.productId === normalizedProductFilter);
+  }, [evaluatedAds, normalizedProductFilter]);
+
+  const summary = useMemo(() => summarizeAdTesting(scopedAds, ruleSettings), [scopedAds, ruleSettings]);
+  const stillNeeded = useMemo(() => buildStillNeeded(summary, selectedProduct), [summary, selectedProduct]);
+  const conclusion = useMemo(
+    () => getProductTestConclusion(selectedProduct, summary, stillNeeded),
+    [selectedProduct, summary, stillNeeded],
+  );
+  const angleCoverage = useMemo(() => getAngleCoverage(scopedAds), [scopedAds]);
+  const formatCoverage = useMemo(() => getFormatCoverage(scopedAds), [scopedAds]);
+
+  const filteredAds = useMemo(() => {
+    if (activeView === "all") return scopedAds;
+    if (activeView === "live") {
+      return scopedAds.filter((ad) => ad.lifecycleState === "Live Testing" || ad.lifecycleState === "Active Winner" || ad.lifecycleState === "Paused");
+    }
+    if (activeView === "tested") {
+      return scopedAds.filter((ad) => ["Tested Winner", "Tested Loser", "Tested Mixed", "Fatigued"].includes(ad.lifecycleState));
+    }
+    if (activeView === "abandoned") {
+      return scopedAds.filter((ad) => ["Abandoned", "Invalid Test", "Archived", "Insufficient Data"].includes(ad.lifecycleState));
+    }
+    return scopedAds.filter((ad) =>
+      [
+        "Kill",
+        "Recut",
+        "Keep Running",
+        "Needs More Spend",
+        "Fix Tracking",
+        "Assign Product",
+        "Add Angle",
+        "Add Format",
+        "Record Stop Reason",
+        "Mark Duplicate",
+        "Review Test Outcome",
+      ].includes(ad.recommendedAction),
+    );
+  }, [activeView, scopedAds]);
+
+  function getAdIssues(ad: EvaluatedAdTest): AdIssueAction[] {
+    const issues: AdIssueAction[] = [];
+    const pushUnique = (issue: AdIssueAction) => {
+      if (!issues.some((existing) => existing.label === issue.label && existing.field === issue.field)) {
+        issues.push(issue);
+      }
+    };
+
+    if (!ad.productId) {
+      pushUnique({
+        label: "Assign product",
+        detail: "Map this ad to a product before it can count.",
+        field: "productId",
+      });
+    }
+    if (!ad.angle || ad.angle === "Unlabeled") {
+      pushUnique({
+        label: "Assign angle",
+        detail: "Label the testing angle so this creative is grouped properly.",
+        field: "angle",
+      });
+    }
+    if (!ad.hook || ad.hook === "Data unavailable") {
+      pushUnique({
+        label: "Add hook",
+        detail: "Record the opening concept for faster review later.",
+        field: "hook",
+      });
+    }
+    if (!ad.format || ad.format === "Data unavailable") {
+      pushUnique({
+        label: "Add format",
+        detail: "Set the creative format to complete coverage tracking.",
+        field: "format",
+      });
+    }
+    if (ad.trackingValid === false || ad.recommendedAction === "Fix Tracking") {
+      pushUnique({
+        label: "Fix tracking",
+        detail: "Tracking is marked broken and needs confirmation.",
+        field: "trackingValid",
+      });
+    }
+    if (ad.landingPageValid === false || ad.recommendedAction === "Fix Landing Page") {
+      pushUnique({
+        label: "Fix landing page",
+        detail: "Landing page validity is blocking clean evaluation.",
+        field: "landingPageValid",
+      });
+    }
+    if (ad.isStopped && !ad.stopReason) {
+      pushUnique({
+        label: "Record stop reason",
+        detail: "Stopped ads should capture why they were turned off.",
+        field: "stopReason",
+      });
+    }
+    if (ad.testValidity === "Needs Review" || ad.recommendedAction === "Review Test Outcome") {
+      pushUnique({
+        label: "Review outcome",
+        detail: "Confirm the final result and validity of this test.",
+        field: "testOutcome",
+      });
+    }
+    if (ad.recommendedAction === "Mark Duplicate" || ad.recommendedAction === "Archive Duplicate") {
+      pushUnique({
+        label: "Mark duplicate",
+        detail: "Link this ad back to the original creative.",
+        field: "duplicateOfAdId",
+      });
+    }
+
+    return issues;
+  }
+
+  const adsByKey = useMemo(() => {
+    const next = new Map<string, EvaluatedAdTest>();
+    for (const ad of evaluatedAds) {
+      next.set(ad.id, ad);
+      next.set(ad.metaAdId || ad.id, ad);
+    }
+    return next;
+  }, [evaluatedAds]);
+
+  function getOriginalAd(ad: EvaluatedAdTest) {
+    let current = ad;
+    const seen = new Set<string>([current.metaAdId || current.id, current.id]);
+
+    while (current.duplicateOfAdId) {
+      const previous = adsByKey.get(current.duplicateOfAdId);
+      if (!previous) break;
+      const previousKey = previous.metaAdId || previous.id;
+      if (seen.has(previousKey)) break;
+      seen.add(previousKey);
+      current = previous;
+    }
+
+    return current;
+  }
+
+  const variantCountByOriginal = useMemo(() => {
+    const next = new Map<string, number>();
+    for (const ad of evaluatedAds) {
+      const original = getOriginalAd(ad);
+      const originalKey = original.metaAdId || original.id;
+      next.set(originalKey, (next.get(originalKey) || 0) + 1);
+    }
+    return next;
+  }, [evaluatedAds, adsByKey]);
+
   return (
     <section className="page">
       <header className="page-header">
         <p className="eyebrow">GrowthOS</p>
         <h1>Ads</h1>
-        <p>Imported Meta ads with GrowthOS product mapping and rule-based ad decisions.</p>
+        <p>Product-testing decision page for real Meta ads, real Shopify economics, and editable GrowthOS test metadata.</p>
       </header>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Ad name</th>
-              <th>Campaign</th>
-              <th>Ad set</th>
-              <th>Assigned product</th>
-              <th>Angle</th>
-              <th>Spend</th>
-              <th>Purchases</th>
-              <th>CPA</th>
-              <th>CTR</th>
-              <th>ROAS</th>
-              <th>Decision</th>
-              <th>Next action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ads.map((ad) => {
-              const product = ad.productId ? productById.get(ad.productId) : undefined;
-              const decision = getAdDecision(ad, product, ruleSettings);
-              return (
-                <tr key={ad.id}>
-                  <td>{ad.name}</td>
-                  <td>{ad.campaignName}</td>
-                  <td>{ad.adSetName}</td>
-                  <td>{product?.name || "Unassigned"}</td>
-                  <td>{ad.angle}</td>
-                  <td>{formatDisplayMoney(ad.spend, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}</td>
-                  <td>{ad.purchases}</td>
-                  <td>{ad.cpa ? formatDisplayMoney(ad.cpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate) : "—"}</td>
-                  <td>{ad.ctr.toFixed(2)}%</td>
-                  <td>{ad.roas.toFixed(1)}x</td>
-                  <td><span className="status connected">{decision}</span></td>
-                  <td>{ad.nextAction}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <article className="card ads-testing-hero">
+        <div className="ads-testing-toolbar">
+          <div className="ads-product-selector">
+            <span>Product focus</span>
+            <div className="ads-product-picker">
+              <button
+                className="ads-product-picker-button"
+                type="button"
+                onClick={() => setIsProductMenuOpen((current) => !current)}
+                aria-expanded={isProductMenuOpen}
+                aria-haspopup="listbox"
+              >
+                {selectedProduct ? (
+                  <ProductVisual
+                    name={selectedProduct.name}
+                    imageUrl={selectedProduct.productImageUrl}
+                    size="sm"
+                  />
+                ) : (
+                  <span className="ads-product-picker-icon" aria-hidden="true">
+                    {normalizedProductFilter === "unmapped" ? "U" : "A"}
+                  </span>
+                )}
+                <span className="ads-product-picker-copy">
+                  <strong>{selectedProductLabel}</strong>
+                  <span>{normalizedProductFilter === "unmapped" ? "Ads without a mapped product" : "Choose a product testing scope"}</span>
+                </span>
+                <span className="brand-action" aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <path
+                      d="m6 9 6 6 6-6"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="2"
+                    />
+                  </svg>
+                </span>
+              </button>
+              {isProductMenuOpen ? (
+                <div className="ads-product-picker-menu" role="listbox" aria-label="Product focus">
+                  <button
+                    className={`ads-product-picker-option ${normalizedProductFilter === "all" ? "active" : ""}`}
+                    type="button"
+                    onClick={() => setSelectedProductFilter("all")}
+                  >
+                    <span className="ads-product-picker-icon" aria-hidden="true">A</span>
+                    <span className="ads-product-picker-copy">
+                      <strong>All Products</strong>
+                      <span>See every mapped and unmapped ad</span>
+                    </span>
+                  </button>
+                  <button
+                    className={`ads-product-picker-option ${normalizedProductFilter === "unmapped" ? "active" : ""}`}
+                    type="button"
+                    onClick={() => setSelectedProductFilter("unmapped")}
+                  >
+                    <span className="ads-product-picker-icon" aria-hidden="true">U</span>
+                    <span className="ads-product-picker-copy">
+                      <strong>Unmapped Ads</strong>
+                      <span>Review ads that still need a product link</span>
+                    </span>
+                  </button>
+                  {sortedProducts.map((product) => (
+                    <button
+                      key={product.id}
+                      className={`ads-product-picker-option ${normalizedProductFilter === product.id ? "active" : ""}`}
+                      type="button"
+                      onClick={() => setSelectedProductFilter(product.id)}
+                    >
+                      <ProductVisual
+                        name={product.name}
+                        imageUrl={product.productImageUrl}
+                        size="sm"
+                      />
+                      <span className="ads-product-picker-copy">
+                        <strong>{product.name}</strong>
+                        <span>{product.role} product</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <div className="product-decision-badges">
+            <span className={`status ${conclusion.fullyTested ? "connected" : "not_connected"}`}>
+              {conclusion.conclusion}
+            </span>
+            <span className="status connected">
+              Valid Tested Ads {summary.validTestedAds} / {summary.requiredValidTestedAds}
+            </span>
+          </div>
+        </div>
+        <div className="ads-testing-hero-copy">
+          <div>
+            <p className="eyebrow">Testing View</p>
+            <div className="ads-testing-title">
+              {selectedProduct ? (
+                <ProductVisual
+                  name={selectedProduct.name}
+                  imageUrl={selectedProduct.productImageUrl}
+                  size="md"
+                />
+              ) : (
+                <span className="ads-product-picker-icon ads-product-picker-icon-lg" aria-hidden="true">
+                  {normalizedProductFilter === "unmapped" ? "U" : "A"}
+                </span>
+              )}
+              <h2>{selectedProductLabel}</h2>
+            </div>
+            <p>{conclusion.why}</p>
+          </div>
+          <div className="ads-testing-hero-callout">
+            <strong>{conclusion.conclusion}</strong>
+            <span>{conclusion.recommendedAction}</span>
+          </div>
+        </div>
+        <div className="ads-testing-summary-grid">
+          <MetricStat label="Valid tested ads" value={`${summary.validTestedAds} / ${summary.requiredValidTestedAds}`} />
+          <MetricStat label="Angles tested" value={`${summary.distinctAnglesTested} / ${summary.requiredAngles}`} />
+          <MetricStat label="Formats tested" value={`${summary.formatsTested} / ${summary.requiredFormats}`} />
+          <MetricStat label="Active ads" value={String(summary.currentlyActive)} />
+          <MetricStat label="Abandoned" value={String(summary.abandonedAds)} />
+          <MetricStat label="Invalid tests" value={String(summary.invalidTests)} />
+          <MetricStat label="Test spend" value={`${formatDisplayMoney(summary.productTestSpend, OPERATING_CURRENCY, displayCurrency, usdToAudRate)} / ${formatDisplayMoney(summary.productTestBudgetCap, OPERATING_CURRENCY, displayCurrency, usdToAudRate)}`} />
+          <MetricStat label="Winners / Losers / Mixed" value={`${summary.testedWinners} / ${summary.testedLosers} / ${summary.testedMixed}`} />
+        </div>
+      </article>
+
+      <div className="ads-testing-support-grid">
+        <article className="card">
+          <div className="card-title-row">
+            <h2>Still Needed</h2>
+            <span className={`status ${stillNeeded.length ? "not_connected" : "connected"}`}>
+              {stillNeeded.length ? `${stillNeeded.length} open` : "Complete"}
+            </span>
+          </div>
+          <div className="entity-list">
+            {stillNeeded.length ? stillNeeded.map((item) => (
+              <div className="entity-row" key={item}>
+                <div className="entity-main">
+                  <div>
+                    <strong>{item}</strong>
+                    <span>Generated from real mapped ad and rule-setting data.</span>
+                  </div>
+                </div>
+              </div>
+            )) : <p className="muted">No additional requirements are blocking this test scope right now.</p>}
+          </div>
+        </article>
+
+        <article className="card">
+          <div className="card-title-row">
+            <h2>Filters</h2>
+          </div>
+          <div className="range-chip-grid">
+            {[
+              ["needs-action", "Needs Action"],
+              ["live", "Live"],
+              ["tested", "Tested"],
+              ["abandoned", "Abandoned / Invalid"],
+              ["all", "All Ads"],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                className={`scope-chip ${activeView === value ? "scope-chip-active" : ""}`}
+                type="button"
+                onClick={() => setActiveView(value as typeof activeView)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="muted">
+            Showing {filteredAds.length} of {scopedAds.length} ads in the current scope.
+          </p>
+        </article>
       </div>
+
+      <div className="ads-stack ads-testing-stack">
+        {filteredAds.length ? filteredAds.map((ad) => {
+          const issues = getAdIssues(ad);
+          const originalAd = getOriginalAd(ad);
+          const originalKey = originalAd.metaAdId || originalAd.id;
+          const currentKey = ad.metaAdId || ad.id;
+          const isOriginalVersion = originalKey === currentKey;
+          const versionCount = variantCountByOriginal.get(originalKey) || 1;
+
+          return (
+            <article className="card ad-testing-card" key={ad.id}>
+              <div className="ad-testing-card-header">
+                <div className="ad-overview-title">
+                  <p className="product-decision-role">{ad.angle}</p>
+                  <h2>{ad.name}</h2>
+                  <p className="ad-overview-subtitle">{ad.campaignName} / {ad.adSetName}</p>
+                </div>
+                <div className="product-decision-badges">
+                  <span className={`status ${ad.testValidity === "Valid" ? "connected" : "not_connected"}`}>
+                    {ad.testValidity}
+                  </span>
+                  <span className="status connected">{ad.lifecycleState}</span>
+                  <span className="status not_connected">{ad.recommendedAction}</span>
+                </div>
+              </div>
+
+              <div className="ad-original-row">
+                <div className="ad-original-copy">
+                  <strong>Original version</strong>
+                  <span>
+                    {isOriginalVersion
+                      ? `This ad is the source creative${versionCount > 1 ? ` for ${versionCount - 1} other version${versionCount - 1 === 1 ? "" : "s"}` : ""}.`
+                      : `${originalAd.name} from ${originalAd.campaignName}.`}
+                  </span>
+                </div>
+                <span className={`status ${isOriginalVersion ? "connected" : "not_connected"}`}>
+                  {isOriginalVersion ? "Original" : "Variant"}
+                </span>
+              </div>
+
+              {issues.length ? (
+                <div className="ad-issue-panel">
+                  <strong>Fix now</strong>
+                  <div className="ad-issue-list">
+                    {issues.map((issue) => (
+                      <button
+                        key={`${ad.id}-${issue.field}-${issue.label}`}
+                        className="ad-issue-chip"
+                        type="button"
+                        onClick={() => openAdEditor(ad.id, issue.field)}
+                        title={issue.detail}
+                      >
+                        <span>{issue.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="ad-testing-card-grid">
+                <div className="ad-side-stack">
+                  <div className="ad-creative-card">
+                    <AdCreativeVisual
+                      name={ad.name}
+                      imageUrl={ad.creativeImageUrl || ad.creativeThumbnailUrl}
+                      posterUrl={ad.creativeThumbnailUrl || ad.creativeImageUrl}
+                      videoUrl={ad.creativeVideoUrl}
+                      type={ad.creativeType}
+                      onOpen={() => setActiveCreative({
+                        embedUrl: ad.creativeEmbedUrl,
+                        name: ad.name,
+                        imageUrl: ad.creativeImageUrl || ad.creativeThumbnailUrl,
+                        posterUrl: ad.creativeThumbnailUrl || ad.creativeImageUrl,
+                        videoUrl: ad.creativeVideoUrl,
+                        type: ad.creativeType,
+                      })}
+                    />
+                    <div className="ad-creative-copy">
+                      <strong>Ad creative</strong>
+                      <span>
+                        {ad.creativeVideoUrl
+                          ? "Click to open video player"
+                          : ad.creativeEmbedUrl
+                            ? "Click to open embedded player"
+                          : ad.creativeType || (ad.creativeImageUrl || ad.creativeThumbnailUrl ? "Click to enlarge preview" : "Preview unavailable from Meta")}
+                      </span>
+                    </div>
+                  </div>
+
+                  <button
+                    className={`ad-product-card ${ad.productId ? "" : "ad-product-card-unassigned"}`}
+                    onClick={() => openAdEditor(ad.id, "productId")}
+                  >
+                    {ad.productId ? (
+                      <>
+                        <ProductVisual name={ad.productName || "Product"} imageUrl={ad.productImageUrl} size="sm" />
+                        <div className="product-meta">
+                          <strong>{ad.productName}</strong>
+                          <span>Mapped product</span>
+                          <span>Click to edit testing metadata</span>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="product-meta">
+                        <strong>Unmapped</strong>
+                        <span>Assign a product before this can count.</span>
+                        <span>Click to edit testing metadata</span>
+                      </div>
+                    )}
+                  </button>
+                </div>
+
+                <div className="ads-card-facts">
+                  <div><strong>Objective</strong><span>{ad.objectiveLabel || "Not set"}</span></div>
+                  <div><strong>Angle</strong><span>{ad.angle}</span></div>
+                  <div><strong>Hook</strong><span>{ad.hook}</span></div>
+                  <div><strong>Format</strong><span>{ad.format}</span></div>
+                  <div><strong>Outcome</strong><span>{ad.testOutcome}</span></div>
+                  <div><strong>Counts</strong><span>{ad.countsTowardProductTest ? "Yes" : "No"}</span></div>
+                  <div><strong>Stop reason</strong><span>{ad.stopReason || "Needs review"}</span></div>
+                </div>
+
+                <div className="ads-testing-metrics">
+                  {[
+                    ["Spend", formatDisplayMoney(ad.spend, OPERATING_CURRENCY, displayCurrency, usdToAudRate)],
+                    ["Purchases", String(ad.purchases)],
+                    ["CPA", ad.cpa ? formatDisplayMoney(ad.cpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate) : "Data unavailable"],
+                    ["CTR", ad.impressions > 0 ? `${ad.ctr.toFixed(2)}%` : "Data unavailable"],
+                    ["ROAS", `${ad.roas.toFixed(1)}x`],
+                    ["Ran total", ad.activeDays ? `${ad.activeDays} day${ad.activeDays === 1 ? "" : "s"}` : "No delivery"],
+                    ["Active range", formatActiveRange(ad.firstActiveDate, ad.lastActiveDate)],
+                    ["Launch / Stop", `${ad.launchedAt || "Not recorded"}${ad.stoppedAt ? ` -> ${ad.stoppedAt}` : ""}`],
+                  ].map(([label, value]) => (
+                    <div className="ads-testing-metric" key={label}>
+                      <span>{label}</span>
+                      <strong>{value}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <AdTimelineChart
+                ad={ad}
+                dateRange={dateRange}
+                displayCurrency={displayCurrency}
+                usdToAudRate={usdToAudRate}
+              />
+
+              <div className="ads-card-footer">
+                <div className="diagnostic-callout ad-next-action">
+                  <strong>{ad.recommendedAction}</strong>
+                  <span>{ad.reason}</span>
+                </div>
+                <div className="ads-card-actions">
+                  {ad.manualOverrides.length ? (
+                    <p className="muted">Manual overrides: {ad.manualOverrides.join(", ")}</p>
+                  ) : (
+                    <p className="muted">Using automatic GrowthOS evaluation from live Meta + Shopify data.</p>
+                  )}
+                  <button
+                    className="btn btn-secondary"
+                    type="button"
+                    onClick={() => toggleAdEditor(ad.id)}
+                  >
+                    {editingAdId === ad.id ? "Close Edit" : "Open/Edit"}
+                  </button>
+                </div>
+              </div>
+
+              {editingAdId === ad.id ? (
+                <AdMetadataEditor
+                  ad={ad}
+                  annotation={adAnnotations[ad.metaAdId || ad.id]}
+                  products={sortedProducts}
+                  allAds={evaluatedAds}
+                  onAssignProduct={assignProduct}
+                  onPatch={updateAnnotation}
+                  onReset={resetAnnotation}
+                  focusField={editorFocusField?.adId === ad.id ? editorFocusField.field : null}
+                />
+              ) : null}
+            </article>
+          );
+        }) : (
+          <article className="card">
+            <div className="card-title-row">
+              <h2>No Ads In This View</h2>
+              <span className="status not_connected">{activeView}</span>
+            </div>
+            <p className="muted">
+              {scopedAds.length
+                ? "This filter has no matching ads right now. Try another filter or update product-testing metadata."
+                : "No ads exist for the current product scope. Switch Product focus back to All Products or another mapped product."}
+            </p>
+          </article>
+        )}
+      </div>
+
+      <div className="ads-testing-support-grid">
+        <article className="card">
+          <div className="card-title-row">
+            <h2>Angle Coverage</h2>
+            <span className="status connected">{angleCoverage.length}</span>
+          </div>
+          <div className="entity-list">
+            {angleCoverage.length ? angleCoverage.map((item) => (
+              <div className="entity-row" key={item.angle}>
+                <div className="entity-main">
+                  <div>
+                    <strong>{item.angle}</strong>
+                    <span>{item.currentStatus}</span>
+                  </div>
+                </div>
+                <div className="entity-metrics">
+                  <strong>{item.validTestedAds} valid / {item.adsLaunched} launched</strong>
+                  <span>W {item.winners} | L {item.losers} | M {item.mixed} | Best CPA {item.bestCpa ? formatDisplayMoney(item.bestCpa, OPERATING_CURRENCY, displayCurrency, usdToAudRate) : "Data unavailable"}</span>
+                </div>
+              </div>
+            )) : <p className="muted">No angle coverage exists for this scope yet.</p>}
+          </div>
+        </article>
+
+        <article className="card">
+          <div className="card-title-row">
+            <h2>Format Coverage</h2>
+            <span className="status connected">{formatCoverage.length}</span>
+          </div>
+          <div className="entity-list">
+            {formatCoverage.length ? formatCoverage.map((item) => (
+              <div className="entity-row" key={item.format}>
+                <div className="entity-main">
+                  <div>
+                    <strong>{item.format}</strong>
+                    <span>{item.adsCreated} created / {item.validTestedAds} valid tested</span>
+                  </div>
+                </div>
+                <div className="entity-metrics">
+                  <strong>{item.bestResult ? formatDisplayMoney(item.bestResult, OPERATING_CURRENCY, displayCurrency, usdToAudRate) : "Data unavailable"}</strong>
+                  <span>Best CPA</span>
+                </div>
+              </div>
+            )) : <p className="muted">No creative format coverage exists for this scope yet.</p>}
+          </div>
+        </article>
+      </div>
+
+      {activeCreative ? (
+        <AdCreativeLightbox creative={activeCreative} onClose={() => setActiveCreative(null)} />
+      ) : null}
     </section>
+  );
+}
+
+function AdMetadataEditor({
+  ad,
+  annotation,
+  products,
+  allAds,
+  onAssignProduct,
+  onPatch,
+  onReset,
+  focusField,
+}: {
+  ad: EvaluatedAdTest;
+  annotation: AdAnnotation | undefined;
+  products: Product[];
+  allAds: EvaluatedAdTest[];
+  onAssignProduct: (metaAdId: string, productId?: string) => void;
+  onPatch: (metaAdId: string, patch: Partial<AdAnnotation>) => void;
+  onReset: (metaAdId: string) => void;
+  focusField: AdEditorField | null;
+}) {
+  const metaAdId = ad.metaAdId || ad.id;
+  const editorRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!focusField || !editorRef.current) return;
+    const focusTarget = editorRef.current.querySelector(
+      `[data-edit-field="${focusField}"] input, [data-edit-field="${focusField}"] select, [data-edit-field="${focusField}"] textarea`,
+    ) as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null;
+    if (!focusTarget) return;
+    focusTarget.focus();
+    focusTarget.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+  }, [focusField]);
+
+  return (
+    <div className="ad-metadata-editor" ref={editorRef}>
+      <div className="card-title-row">
+        <h3>Testing metadata</h3>
+        <button className="btn btn-ghost" type="button" onClick={() => onReset(metaAdId)}>
+          Reset Overrides
+        </button>
+      </div>
+
+      <div className="ads-editor-grid">
+        <label className={`settings-brand-card ${focusField === "productId" ? "ad-editor-focus" : ""}`} data-edit-field="productId">
+          <span className="settings-brand-label">Assigned product</span>
+          <select
+            value={ad.productId || ""}
+            onChange={(event) => onAssignProduct(metaAdId, event.target.value || undefined)}
+          >
+            <option value="">Unassigned</option>
+            {products.map((product) => (
+              <option key={product.id} value={product.id}>{product.name}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "angle" ? "ad-editor-focus" : ""}`} data-edit-field="angle">
+          <span className="settings-brand-label">Angle</span>
+          <input
+            value={annotation?.angle || ""}
+            onChange={(event) => onPatch(metaAdId, { angle: event.target.value })}
+            placeholder="Guilt / Bored Indoor Cat"
+          />
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "hook" ? "ad-editor-focus" : ""}`} data-edit-field="hook">
+          <span className="settings-brand-label">Hook</span>
+          <input
+            value={annotation?.hook || ""}
+            onChange={(event) => onPatch(metaAdId, { hook: event.target.value })}
+            placeholder="Lead line or opening concept"
+          />
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "format" ? "ad-editor-focus" : ""}`} data-edit-field="format">
+          <span className="settings-brand-label">Format</span>
+          <input
+            list={`format-options-${metaAdId}`}
+            value={annotation?.format || ""}
+            onChange={(event) => onPatch(metaAdId, { format: event.target.value })}
+            placeholder="UGC, Direct Demo, Static..."
+          />
+          <datalist id={`format-options-${metaAdId}`}>
+            {AD_FORMAT_SUGGESTIONS.map((format) => (
+              <option key={format} value={format} />
+            ))}
+          </datalist>
+        </label>
+
+        <label className="settings-brand-card">
+          <span className="settings-brand-label">Creative family</span>
+          <input
+            value={annotation?.creativeFamilyId || ""}
+            onChange={(event) => onPatch(metaAdId, { creativeFamilyId: event.target.value })}
+            placeholder="family-01"
+          />
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "duplicateOfAdId" ? "ad-editor-focus" : ""}`} data-edit-field="duplicateOfAdId">
+          <span className="settings-brand-label">Duplicate of ad</span>
+          <select
+            value={annotation?.duplicateOfAdId || ""}
+            onChange={(event) => onPatch(metaAdId, { duplicateOfAdId: event.target.value || undefined })}
+          >
+            <option value="">None</option>
+            {allAds
+              .filter((candidate) => candidate.id !== ad.id)
+              .map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>{candidate.name}</option>
+              ))}
+          </select>
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "trackingValid" ? "ad-editor-focus" : ""}`} data-edit-field="trackingValid">
+          <span className="settings-brand-label">Tracking validity</span>
+          <select
+            value={annotation?.trackingValid === undefined ? "" : annotation.trackingValid ? "true" : "false"}
+            onChange={(event) =>
+              onPatch(metaAdId, {
+                trackingValid:
+                  event.target.value === "" ? undefined : event.target.value === "true",
+              })
+            }
+          >
+            <option value="">Auto / valid</option>
+            <option value="true">Valid</option>
+            <option value="false">Broken</option>
+          </select>
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "landingPageValid" ? "ad-editor-focus" : ""}`} data-edit-field="landingPageValid">
+          <span className="settings-brand-label">Landing page validity</span>
+          <select
+            value={annotation?.landingPageValid === undefined ? "" : annotation.landingPageValid ? "true" : "false"}
+            onChange={(event) =>
+              onPatch(metaAdId, {
+                landingPageValid:
+                  event.target.value === "" ? undefined : event.target.value === "true",
+              })
+            }
+          >
+            <option value="">Auto / valid</option>
+            <option value="true">Valid</option>
+            <option value="false">Broken</option>
+          </select>
+        </label>
+
+        <label className="settings-brand-card">
+          <span className="settings-brand-label">Product availability</span>
+          <select
+            value={annotation?.productAvailable === undefined ? "" : annotation.productAvailable ? "true" : "false"}
+            onChange={(event) =>
+              onPatch(metaAdId, {
+                productAvailable:
+                  event.target.value === "" ? undefined : event.target.value === "true",
+              })
+            }
+          >
+            <option value="">Auto / available</option>
+            <option value="true">Available</option>
+            <option value="false">Unavailable</option>
+          </select>
+        </label>
+
+        <label className="settings-brand-card">
+          <span className="settings-brand-label">Lifecycle state</span>
+          <select
+            value={annotation?.lifecycleState || ""}
+            onChange={(event) => onPatch(metaAdId, { lifecycleState: event.target.value as AdLifecycleState || undefined })}
+          >
+            <option value="">Auto</option>
+            {adLifecycleOptions.map((option) => (
+              <option key={option} value={option}>{option}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "testOutcome" ? "ad-editor-focus" : ""}`} data-edit-field="testOutcome">
+          <span className="settings-brand-label">Test outcome</span>
+          <select
+            value={annotation?.testOutcome || ""}
+            onChange={(event) => onPatch(metaAdId, { testOutcome: event.target.value as AdTestOutcome || undefined })}
+          >
+            <option value="">Auto</option>
+            {adTestOutcomeOptions.map((option) => (
+              <option key={option} value={option}>{option}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "testValidity" ? "ad-editor-focus" : ""}`} data-edit-field="testValidity">
+          <span className="settings-brand-label">Test validity</span>
+          <select
+            value={annotation?.testValidity || ""}
+            onChange={(event) => onPatch(metaAdId, { testValidity: event.target.value as AdTestValidity || undefined })}
+          >
+            <option value="">Auto</option>
+            {adTestValidityOptions.map((option) => (
+              <option key={option} value={option}>{option}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className={`settings-brand-card ${focusField === "stopReason" ? "ad-editor-focus" : ""}`} data-edit-field="stopReason">
+          <span className="settings-brand-label">Stop reason</span>
+          <select
+            value={annotation?.stopReason || ""}
+            onChange={(event) => onPatch(metaAdId, { stopReason: event.target.value as AdStopReason || undefined })}
+          >
+            <option value="">Not recorded</option>
+            {adStopReasonOptions.map((option) => (
+              <option key={option} value={option}>{option}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className="settings-brand-card">
+          <span className="settings-brand-label">Counts toward product test</span>
+          <select
+            value={
+              annotation?.countsTowardProductTestOverride === undefined
+                ? ""
+                : annotation.countsTowardProductTestOverride
+                  ? "true"
+                  : "false"
+            }
+            onChange={(event) =>
+              onPatch(metaAdId, {
+                countsTowardProductTestOverride:
+                  event.target.value === ""
+                    ? undefined
+                    : event.target.value === "true",
+              })
+            }
+          >
+            <option value="">Auto</option>
+            <option value="true">Yes</option>
+            <option value="false">No</option>
+          </select>
+        </label>
+
+        <label className="settings-brand-card">
+          <span className="settings-brand-label">Launched at</span>
+          <input
+            type="date"
+            value={annotation?.launchedAt || ""}
+            onChange={(event) => onPatch(metaAdId, { launchedAt: event.target.value || undefined })}
+          />
+        </label>
+
+        <label className="settings-brand-card">
+          <span className="settings-brand-label">Stopped at</span>
+          <input
+            type="date"
+            value={annotation?.stoppedAt || ""}
+            onChange={(event) => onPatch(metaAdId, { stoppedAt: event.target.value || undefined })}
+          />
+        </label>
+
+        <label className="settings-brand-card">
+          <span className="settings-brand-label">Break-even CPA at test</span>
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            value={annotation?.breakEvenCpaAtTest || ""}
+            onChange={(event) => onPatch(metaAdId, {
+              breakEvenCpaAtTest: event.target.value ? Number(event.target.value) : undefined,
+            })}
+            placeholder="Optional override"
+          />
+        </label>
+      </div>
+
+      <label className="settings-brand-card ad-notes-card">
+        <span className="settings-brand-label">Notes</span>
+        <textarea
+          value={annotation?.notes || ""}
+          onChange={(event) => onPatch(metaAdId, { notes: event.target.value || undefined })}
+          rows={4}
+          placeholder="Record why the ad stopped, why it is invalid, or what should happen next."
+        />
+      </label>
+    </div>
   );
 }
 
@@ -3665,12 +5925,22 @@ function ProductDetailPage({
           <nav className="breadcrumb"><button onClick={() => navigate("/products")}>Products</button><span>/</span><strong>{product.name}</strong></nav>
         </div>
         <p className="eyebrow">Product detail</p>
-        <h1>{product.name}</h1>
-        <p>{decision}: {product.nextAction}</p>
+        <div className="product-detail-hero">
+          <ProductVisual
+            name={product.name}
+            imageUrl={product.productImageUrl || shopify?.productImageUrl}
+            size="lg"
+          />
+          <div className="product-detail-hero-copy">
+            <h1>{product.name}</h1>
+            <p>{decision}: {product.nextAction}</p>
+          </div>
+        </div>
       </header>
       <div className="metric-grid">
         <MetricCard label="Spend" value={formatDisplayMoney(product.totalSpend, OPERATING_CURRENCY, displayCurrency, usdToAudRate)} />
         <MetricCard label="Revenue" value={formatDisplayMoney(product.revenue, OPERATING_CURRENCY, displayCurrency, usdToAudRate)} />
+        <MetricCard label="Zendrop landed cost" value={formatDisplayMoney(product.zendropLandedCost, OPERATING_CURRENCY, displayCurrency, usdToAudRate)} />
         <MetricCard label="Purchases" value={String(product.purchases)} />
         <MetricCard label="Profit/Loss" value={formatDisplayMoney(estimatedProfit(product), OPERATING_CURRENCY, displayCurrency, usdToAudRate)} />
       </div>
@@ -3684,6 +5954,8 @@ function ProductDetailPage({
           <div><strong>{product.adsTestedCount} / {product.requiredAdsBeforeJudgment}</strong><span>Ads tested progress</span></div>
           <div><strong>{shopify ? shopify.productTitle : "Not linked"}</strong><span>Shopify product</span></div>
           <div><strong>{mappings.filter((mapping) => mapping.productId === product.id).length}</strong><span>Manual/auto mappings</span></div>
+          <div><strong>{product.zendropOrders}</strong><span>Zendrop matched orders</span></div>
+          <div><strong>{product.averageUnitLandedCost ? formatDisplayMoney(product.averageUnitLandedCost, OPERATING_CURRENCY, displayCurrency, usdToAudRate) : "—"}</strong><span>Average landed cost / unit</span></div>
         </div>
       </article>
       <AdsBreakdown title="Assigned ads" ads={assignedAds} displayCurrency={displayCurrency} usdToAudRate={usdToAudRate} />

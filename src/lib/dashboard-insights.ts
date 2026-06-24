@@ -319,6 +319,7 @@ export function buildWeeklyActionPlan(
 export function summarizeBusiness(products: Product[], ads: GrowthAd[], mappings: ProductAdMapping[]) {
   const totalSpend = ads.reduce((sum, ad) => sum + ad.spend, 0);
   const totalRevenue = products.reduce((sum, product) => sum + getProductRevenueReference(product, ads.filter((ad) => ad.productId === product.id)), 0);
+  const totalZendropLandedCost = products.reduce((sum, product) => sum + product.zendropLandedCost, 0);
   const activeProducts = products.filter(
     (product) => product.totalSpend > 0 || product.purchases > 0 || product.status !== "Preparing",
   );
@@ -328,7 +329,8 @@ export function summarizeBusiness(products: Product[], ads: GrowthAd[], mappings
   return {
     totalSpend,
     totalRevenue,
-    estimatedProfitLoss: totalRevenue - totalSpend,
+    totalZendropLandedCost,
+    estimatedProfitLoss: totalRevenue - totalSpend - totalZendropLandedCost,
     activeProducts: activeProducts.length,
     activeAds: activeAds.length,
     unmappedAds: unmappedAds.length,

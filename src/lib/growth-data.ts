@@ -9,6 +9,7 @@ import type {
   RuleSettings,
   ShopifyProductImport,
   MetaAdImport,
+  ZendropOrderCost,
 } from "../types";
 import { getAdDecision, getProductDecision, nextActionForDecision } from "./rules/decisions";
 
@@ -22,7 +23,6 @@ function convertCurrency(value: number, from: CurrencyCode, to: CurrencyCode, us
 
 export const KNOWN_GROWTH_PRODUCTS = [
   { id: "stay-in-spinner", name: "Stay-In Spinner" },
-  { id: "flappy-bird", name: "Flappy Bird" },
 ] as const;
 
 export function slugify(value: string) {
@@ -38,7 +38,6 @@ export function detectProductForAd(ad: Pick<MetaAdImport, "adName" | "campaignNa
 } {
   const text = `${ad.adName} ${ad.campaignName} ${ad.adSetName}`.toLowerCase();
   if (text.includes("spinner")) return { productId: "stay-in-spinner", confidence: "High" };
-  if (/(flappy|flapper|bird|flapping)/i.test(text)) return { productId: "flappy-bird", confidence: "High" };
   return { productId: undefined, confidence: "Low" };
 }
 
@@ -74,6 +73,7 @@ function statusFromMetrics(spend: number, purchases: number, cpa: number, breakE
 
 export function buildGrowthProducts(
   shopifyProducts: ShopifyProductImport[],
+  zendropOrders: ZendropOrderCost[],
   rules: RuleSettings,
   usdToAudRate: number,
 ): Product[] {
@@ -83,16 +83,48 @@ export function buildGrowthProducts(
       id: slugify(product.productTitle),
       name: product.productTitle,
       shopifyProductId: product.shopifyProductId,
+      productImageUrl: product.productImageUrl,
     })),
   ];
-  const byId = new Map<string, { id: string; name: string; shopifyProductId?: string }>();
+  const byId = new Map<string, {
+    id: string;
+    name: string;
+    shopifyProductId?: string;
+    productImageUrl?: string;
+  }>();
   for (const product of sourceProducts) {
     if (!byId.has(product.id)) byId.set(product.id, product);
+  }
+
+  const zendropBySlug = new Map<string, ZendropOrderCost[]>();
+  for (const order of zendropOrders) {
+    const key = slugify(order.productName);
+    const current = zendropBySlug.get(key) || [];
+    current.push(order);
+    zendropBySlug.set(key, current);
   }
 
   return [...byId.values()].map((product, index) => {
     const shopify = shopifyProducts.find(
       (item) => item.shopifyProductId === product.shopifyProductId || slugify(item.productTitle) === product.id,
+    );
+    const matchedZendropOrders =
+      zendropBySlug.get(product.id) ||
+      (shopify?.productTitle ? zendropBySlug.get(slugify(shopify.productTitle)) : undefined) ||
+      [];
+    const zendropOrdersCount = matchedZendropOrders.length;
+    const zendropUnits = matchedZendropOrders.reduce((sum, row) => sum + row.quantity, 0);
+    const zendropProductCost = matchedZendropOrders.reduce(
+      (sum, row) => sum + convertCurrency(row.productCost, row.currency, "AUD", usdToAudRate),
+      0,
+    );
+    const zendropShippingCost = matchedZendropOrders.reduce(
+      (sum, row) => sum + convertCurrency(row.shippingCost, row.currency, "AUD", usdToAudRate),
+      0,
+    );
+    const zendropLandedCost = matchedZendropOrders.reduce(
+      (sum, row) => sum + convertCurrency(row.totalCost, row.currency, "AUD", usdToAudRate),
+      0,
     );
     const audPrice = shopify?.price ? convertCurrency(shopify.price, "USD", "AUD", usdToAudRate) : 0;
     const breakEvenCpa = audPrice ? Math.max(1, Math.round(audPrice * 0.6)) : 20;
@@ -101,12 +133,19 @@ export function buildGrowthProducts(
       name: product.name,
       shopifyProductId: shopify?.shopifyProductId || product.shopifyProductId,
       shopifyProductTitle: shopify?.productTitle,
+      productImageUrl: shopify?.productImageUrl || product.productImageUrl,
       role: roleForIndex(index),
       status: shopify?.orders ? "Testing" : "Preparing",
       dailyBudget: index < 2 ? 50 : 0,
       totalSpend: 0,
       revenue: convertCurrency(shopify?.netSales || shopify?.revenue || 0, "USD", "AUD", usdToAudRate),
       purchases: 0,
+      zendropOrders: zendropOrdersCount,
+      zendropUnits,
+      zendropProductCost,
+      zendropShippingCost,
+      zendropLandedCost,
+      averageUnitLandedCost: zendropUnits > 0 ? zendropLandedCost / zendropUnits : 0,
       breakEvenCpa,
       breakEvenCpaSource: audPrice ? "catalog" : "fallback",
       currentCpa: 0,
@@ -139,8 +178,30 @@ export function buildGrowthAds(
       metaAdId: ad.metaAdId,
       name: ad.adName,
       productId: mapping?.productId,
+      campaignId: ad.campaignId,
+      creativeImageUrl: ad.creativeImageUrl,
+      creativeThumbnailUrl: ad.creativeThumbnailUrl,
+      creativeVideoUrl: ad.creativeVideoUrl,
+      creativeEmbedUrl: ad.creativeEmbedUrl,
+      creativeType: ad.creativeType,
       campaignName: ad.campaignName,
+      campaignObjective: ad.campaignObjective,
+      objectiveLabel: ad.objectiveLabel,
+      adSetId: ad.adSetId,
       adSetName: ad.adSetName,
+      optimizationGoal: ad.optimizationGoal,
+      firstActiveDate: ad.firstActiveDate,
+      lastActiveDate: ad.lastActiveDate,
+      activeDays: ad.activeDays,
+      dailyActivity: Array.isArray(ad.dailyActivity)
+        ? ad.dailyActivity.map((point) => ({
+            date: point.date,
+            spend: convertCurrency(point.spend, metaCurrency, "AUD", usdToAudRate),
+            impressions: point.impressions,
+            clicks: point.clicks,
+            purchases: point.purchases,
+          }))
+        : [],
       angle: inferAngle(ad),
       hook: inferHook(ad),
       status: ad.spend > 0 ? "Live Test" : "Produced",
@@ -201,7 +262,7 @@ export function applyProductMetrics(
 }
 
 export function estimatedProfit(product: Product) {
-  return product.revenue - product.totalSpend;
+  return product.revenue - product.totalSpend - product.zendropLandedCost;
 }
 
 function inferAngle(ad: MetaAdImport) {
